@@ -18,13 +18,23 @@ import (
 	"bytes"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/coreos/etcd/Godeps/_workspace/src/github.com/gogo/protobuf/proto"
 	"github.com/coreos/etcd/Godeps/_workspace/src/golang.org/x/net/context"
 	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
 	"github.com/coreos/etcd/lease"
+	"github.com/coreos/etcd/lease/leasehttp"
 	dstorage "github.com/coreos/etcd/storage"
 	"github.com/coreos/etcd/storage/storagepb"
+)
+
+const (
+	// the max request size that raft accepts.
+	// TODO: make this a flag? But we probably do not want to
+	// accept large request which might block raft stream. User
+	// specify a large value might end up with shooting in the foot.
+	maxRequestBytes = 1.5 * 1024 * 1024
 )
 
 type RaftKV interface {
@@ -33,6 +43,7 @@ type RaftKV interface {
 	DeleteRange(ctx context.Context, r *pb.DeleteRangeRequest) (*pb.DeleteRangeResponse, error)
 	Txn(ctx context.Context, r *pb.TxnRequest) (*pb.TxnResponse, error)
 	Compact(ctx context.Context, r *pb.CompactionRequest) (*pb.CompactionResponse, error)
+	Hash(ctx context.Context, r *pb.HashRequest) (*pb.HashResponse, error)
 }
 
 type Lessor interface {
@@ -46,7 +57,15 @@ type Lessor interface {
 	LeaseRenew(id lease.LeaseID) (int64, error)
 }
 
+type Authenticator interface {
+	AuthEnable(ctx context.Context, r *pb.AuthEnableRequest) (*pb.AuthEnableResponse, error)
+}
+
 func (s *EtcdServer) Range(ctx context.Context, r *pb.RangeRequest) (*pb.RangeResponse, error) {
+	if r.Serializable {
+		return applyRange(noTxn, s.kv, r)
+	}
+
 	result, err := s.processInternalRaftRequest(ctx, pb.InternalRaftRequest{Range: r})
 	if err != nil {
 		return nil, err
@@ -83,10 +102,31 @@ func (s *EtcdServer) Compact(ctx context.Context, r *pb.CompactionRequest) (*pb.
 	if err != nil {
 		return nil, err
 	}
-	return result.resp.(*pb.CompactionResponse), result.err
+	resp := result.resp.(*pb.CompactionResponse)
+	if resp == nil {
+		resp = &pb.CompactionResponse{}
+	}
+	if resp.Header == nil {
+		resp.Header = &pb.ResponseHeader{}
+	}
+	resp.Header.Revision = s.kv.Rev()
+	return resp, result.err
+}
+
+func (s *EtcdServer) Hash(ctx context.Context, r *pb.HashRequest) (*pb.HashResponse, error) {
+	h, err := s.be.Hash()
+	if err != nil {
+		return nil, err
+	}
+	return &pb.HashResponse{Header: &pb.ResponseHeader{Revision: s.kv.Rev()}, Hash: h}, nil
 }
 
 func (s *EtcdServer) LeaseCreate(ctx context.Context, r *pb.LeaseCreateRequest) (*pb.LeaseCreateResponse, error) {
+	// no id given? choose one
+	for r.ID == int64(lease.NoLease) {
+		// only use positive int64 id's
+		r.ID = int64(s.reqIDGen.Next() & ((1 << 63) - 1))
+	}
 	result, err := s.processInternalRaftRequest(ctx, pb.InternalRaftRequest{LeaseCreate: r})
 	if err != nil {
 		return nil, err
@@ -103,7 +143,46 @@ func (s *EtcdServer) LeaseRevoke(ctx context.Context, r *pb.LeaseRevokeRequest) 
 }
 
 func (s *EtcdServer) LeaseRenew(id lease.LeaseID) (int64, error) {
-	return s.lessor.Renew(id)
+	ttl, err := s.lessor.Renew(id)
+	if err == nil {
+		return ttl, nil
+	}
+	if err != lease.ErrNotPrimary {
+		return -1, err
+	}
+
+	// renewals don't go through raft; forward to leader manually
+	leader := s.cluster.Member(s.Leader())
+	for i := 0; i < 5 && leader == nil; i++ {
+		// wait an election
+		dur := time.Duration(s.cfg.ElectionTicks) * time.Duration(s.cfg.TickMs) * time.Millisecond
+		select {
+		case <-time.After(dur):
+			leader = s.cluster.Member(s.Leader())
+		case <-s.done:
+			return -1, ErrStopped
+		}
+	}
+	if leader == nil || len(leader.PeerURLs) == 0 {
+		return -1, ErrNoLeader
+	}
+
+	for _, url := range leader.PeerURLs {
+		lurl := url + "/leases"
+		ttl, err = leasehttp.RenewHTTP(id, lurl, s.peerRt, s.cfg.peerDialTimeout())
+		if err == nil {
+			break
+		}
+	}
+	return ttl, err
+}
+
+func (s *EtcdServer) AuthEnable(ctx context.Context, r *pb.AuthEnableRequest) (*pb.AuthEnableResponse, error) {
+	result, err := s.processInternalRaftRequest(ctx, pb.InternalRaftRequest{AuthEnable: r})
+	if err != nil {
+		return nil, err
+	}
+	return result.resp.(*pb.AuthEnableResponse), result.err
 }
 
 type applyResult struct {
@@ -118,6 +197,11 @@ func (s *EtcdServer) processInternalRaftRequest(ctx context.Context, r pb.Intern
 	if err != nil {
 		return nil, err
 	}
+
+	if len(data) > maxRequestBytes {
+		return nil, ErrRequestTooLarge
+	}
+
 	ch := s.w.Register(r.ID)
 
 	s.r.Propose(ctx, data)
@@ -155,17 +239,19 @@ func (s *EtcdServer) applyV3Request(r *pb.InternalRaftRequest) interface{} {
 	case r.Range != nil:
 		ar.resp, ar.err = applyRange(noTxn, kv, r.Range)
 	case r.Put != nil:
-		ar.resp, ar.err = applyPut(noTxn, kv, r.Put)
+		ar.resp, ar.err = applyPut(noTxn, kv, le, r.Put)
 	case r.DeleteRange != nil:
 		ar.resp, ar.err = applyDeleteRange(noTxn, kv, r.DeleteRange)
 	case r.Txn != nil:
-		ar.resp, ar.err = applyTxn(kv, r.Txn)
+		ar.resp, ar.err = applyTxn(kv, le, r.Txn)
 	case r.Compaction != nil:
 		ar.resp, ar.err = applyCompaction(kv, r.Compaction)
 	case r.LeaseCreate != nil:
 		ar.resp, ar.err = applyLeaseCreate(le, r.LeaseCreate)
 	case r.LeaseRevoke != nil:
 		ar.resp, ar.err = applyLeaseRevoke(le, r.LeaseRevoke)
+	case r.AuthEnable != nil:
+		ar.resp, ar.err = applyAuthEnable(s)
 	default:
 		panic("not implemented")
 	}
@@ -173,7 +259,7 @@ func (s *EtcdServer) applyV3Request(r *pb.InternalRaftRequest) interface{} {
 	return ar
 }
 
-func applyPut(txnID int64, kv dstorage.KV, p *pb.PutRequest) (*pb.PutResponse, error) {
+func applyPut(txnID int64, kv dstorage.KV, le lease.Lessor, p *pb.PutRequest) (*pb.PutResponse, error) {
 	resp := &pb.PutResponse{}
 	resp.Header = &pb.ResponseHeader{}
 	var (
@@ -186,7 +272,13 @@ func applyPut(txnID int64, kv dstorage.KV, p *pb.PutRequest) (*pb.PutResponse, e
 			return nil, err
 		}
 	} else {
-		rev = kv.Put(p.Key, p.Value, lease.LeaseID(p.Lease))
+		leaseID := lease.LeaseID(p.Lease)
+		if leaseID != lease.NoLease {
+			if l := le.Lookup(leaseID); l == nil {
+				return nil, lease.ErrLeaseNotFound
+			}
+		}
+		rev = kv.Put(p.Key, p.Value, leaseID)
 	}
 	resp.Header.Revision = rev
 	return resp, nil
@@ -240,6 +332,10 @@ func applyRange(txnID int64, kv dstorage.KV, r *pb.RangeRequest) (*pb.RangeRespo
 		rev int64
 		err error
 	)
+
+	if isGteRange(r.RangeEnd) {
+		r.RangeEnd = []byte{}
+	}
 
 	limit := r.Limit
 	if r.SortOrder != pb.RangeRequest_NONE {
@@ -302,42 +398,76 @@ func applyDeleteRange(txnID int64, kv dstorage.KV, dr *pb.DeleteRangeRequest) (*
 	resp.Header = &pb.ResponseHeader{}
 
 	var (
+		n   int64
 		rev int64
 		err error
 	)
 
+	if isGteRange(dr.RangeEnd) {
+		dr.RangeEnd = []byte{}
+	}
+
 	if txnID != noTxn {
-		_, rev, err = kv.TxnDeleteRange(txnID, dr.Key, dr.RangeEnd)
+		n, rev, err = kv.TxnDeleteRange(txnID, dr.Key, dr.RangeEnd)
 		if err != nil {
 			return nil, err
 		}
 	} else {
-		_, rev = kv.DeleteRange(dr.Key, dr.RangeEnd)
+		n, rev = kv.DeleteRange(dr.Key, dr.RangeEnd)
 	}
 
+	resp.Deleted = n
 	resp.Header.Revision = rev
 	return resp, nil
 }
 
-func applyTxn(kv dstorage.KV, rt *pb.TxnRequest) (*pb.TxnResponse, error) {
-	var revision int64
-
-	txnID := kv.TxnBegin()
-	defer func() {
-		err := kv.TxnEnd(txnID)
-		if err != nil {
-			panic(fmt.Sprint("unexpected error when closing txn", txnID))
+func checkRequestLeases(le lease.Lessor, reqs []*pb.RequestUnion) error {
+	for _, requ := range reqs {
+		tv, ok := requ.Request.(*pb.RequestUnion_RequestPut)
+		if !ok {
+			continue
 		}
-	}()
+		preq := tv.RequestPut
+		if preq == nil || lease.LeaseID(preq.Lease) == lease.NoLease {
+			continue
+		}
+		if l := le.Lookup(lease.LeaseID(preq.Lease)); l == nil {
+			return lease.ErrLeaseNotFound
+		}
+	}
+	return nil
+}
+
+func checkRequestRange(kv dstorage.KV, reqs []*pb.RequestUnion) error {
+	for _, requ := range reqs {
+		tv, ok := requ.Request.(*pb.RequestUnion_RequestRange)
+		if !ok {
+			continue
+		}
+		greq := tv.RequestRange
+		if greq == nil || greq.Revision == 0 {
+			continue
+		}
+
+		if greq.Revision > kv.Rev() {
+			return dstorage.ErrFutureRev
+		}
+		if greq.Revision < kv.FirstRev() {
+			return dstorage.ErrCompacted
+		}
+	}
+	return nil
+}
+
+func applyTxn(kv dstorage.KV, le lease.Lessor, rt *pb.TxnRequest) (*pb.TxnResponse, error) {
+	var revision int64
 
 	ok := true
 	for _, c := range rt.Compare {
-		if revision, ok = applyCompare(txnID, kv, c); !ok {
+		if revision, ok = applyCompare(kv, c); !ok {
 			break
 		}
 	}
-
-	// TODO: check potential errors before actually applying anything
 
 	var reqs []*pb.RequestUnion
 	if ok {
@@ -345,6 +475,23 @@ func applyTxn(kv dstorage.KV, rt *pb.TxnRequest) (*pb.TxnResponse, error) {
 	} else {
 		reqs = rt.Failure
 	}
+
+	if err := checkRequestLeases(le, reqs); err != nil {
+		return nil, err
+	}
+	if err := checkRequestRange(kv, reqs); err != nil {
+		return nil, err
+	}
+
+	// When executing the operations of txn, we need to hold the txn lock.
+	// So the reader will not see any intermediate results.
+	txnID := kv.TxnBegin()
+	defer func() {
+		err := kv.TxnEnd(txnID)
+		if err != nil {
+			panic(fmt.Sprint("unexpected error when closing txn", txnID))
+		}
+	}()
 
 	resps := make([]*pb.ResponseUnion, len(reqs))
 	for i := range reqs {
@@ -376,41 +523,43 @@ func applyCompaction(kv dstorage.KV, compaction *pb.CompactionRequest) (*pb.Comp
 }
 
 func applyUnion(txnID int64, kv dstorage.KV, union *pb.RequestUnion) *pb.ResponseUnion {
-	switch {
-	case union.RequestRange != nil:
-		resp, err := applyRange(txnID, kv, union.RequestRange)
-		if err != nil {
-			panic("unexpected error during txn")
+	switch tv := union.Request.(type) {
+	case *pb.RequestUnion_RequestRange:
+		if tv.RequestRange != nil {
+			resp, err := applyRange(txnID, kv, tv.RequestRange)
+			if err != nil {
+				panic("unexpected error during txn")
+			}
+			return &pb.ResponseUnion{Response: &pb.ResponseUnion_ResponseRange{ResponseRange: resp}}
 		}
-		return &pb.ResponseUnion{ResponseRange: resp}
-	case union.RequestPut != nil:
-		resp, err := applyPut(txnID, kv, union.RequestPut)
-		if err != nil {
-			panic("unexpected error during txn")
+	case *pb.RequestUnion_RequestPut:
+		if tv.RequestPut != nil {
+			resp, err := applyPut(txnID, kv, nil, tv.RequestPut)
+			if err != nil {
+				panic("unexpected error during txn")
+			}
+			return &pb.ResponseUnion{Response: &pb.ResponseUnion_ResponsePut{ResponsePut: resp}}
 		}
-		return &pb.ResponseUnion{ResponsePut: resp}
-	case union.RequestDeleteRange != nil:
-		resp, err := applyDeleteRange(txnID, kv, union.RequestDeleteRange)
-		if err != nil {
-			panic("unexpected error during txn")
+	case *pb.RequestUnion_RequestDeleteRange:
+		if tv.RequestDeleteRange != nil {
+			resp, err := applyDeleteRange(txnID, kv, tv.RequestDeleteRange)
+			if err != nil {
+				panic("unexpected error during txn")
+			}
+			return &pb.ResponseUnion{Response: &pb.ResponseUnion_ResponseDeleteRange{ResponseDeleteRange: resp}}
 		}
-		return &pb.ResponseUnion{ResponseDeleteRange: resp}
 	default:
 		// empty union
 		return nil
 	}
+	return nil
 }
 
 // applyCompare applies the compare request.
-// applyCompare should only be called within a txn request and an valid txn ID must
-// be presented. Or applyCompare panics.
 // It returns the revision at which the comparison happens. If the comparison
 // succeeds, the it returns true. Otherwise it returns false.
-func applyCompare(txnID int64, kv dstorage.KV, c *pb.Compare) (int64, bool) {
-	if txnID == noTxn {
-		panic("applyCompare called with noTxn")
-	}
-	ckvs, rev, err := kv.TxnRange(txnID, c.Key, nil, 1, 0)
+func applyCompare(kv dstorage.KV, c *pb.Compare) (int64, bool) {
+	ckvs, rev, err := kv.Range(c.Key, nil, 1, 0)
 	if err != nil {
 		if err == dstorage.ErrTxnIDMismatch {
 			panic("unexpected txn ID mismatch error")
@@ -435,13 +584,26 @@ func applyCompare(txnID int64, kv dstorage.KV, c *pb.Compare) (int64, bool) {
 	var result int
 	switch c.Target {
 	case pb.Compare_VALUE:
-		result = bytes.Compare(ckv.Value, c.Value)
+		tv, _ := c.TargetUnion.(*pb.Compare_Value)
+		if tv != nil {
+			result = bytes.Compare(ckv.Value, tv.Value)
+		}
 	case pb.Compare_CREATE:
-		result = compareInt64(ckv.CreateRevision, c.CreateRevision)
+		tv, _ := c.TargetUnion.(*pb.Compare_CreateRevision)
+		if tv != nil {
+			result = compareInt64(ckv.CreateRevision, tv.CreateRevision)
+		}
+
 	case pb.Compare_MOD:
-		result = compareInt64(ckv.ModRevision, c.ModRevision)
+		tv, _ := c.TargetUnion.(*pb.Compare_ModRevision)
+		if tv != nil {
+			result = compareInt64(ckv.ModRevision, tv.ModRevision)
+		}
 	case pb.Compare_VERSION:
-		result = compareInt64(ckv.Version, c.Version)
+		tv, _ := c.TargetUnion.(*pb.Compare_Version)
+		if tv != nil {
+			result = compareInt64(ckv.Version, tv.Version)
+		}
 	}
 
 	switch c.Result {
@@ -462,9 +624,13 @@ func applyCompare(txnID int64, kv dstorage.KV, c *pb.Compare) (int64, bool) {
 }
 
 func applyLeaseCreate(le lease.Lessor, lc *pb.LeaseCreateRequest) (*pb.LeaseCreateResponse, error) {
-	l := le.Grant(lc.TTL)
-
-	return &pb.LeaseCreateResponse{ID: int64(l.ID), TTL: l.TTL}, nil
+	l, err := le.Grant(lease.LeaseID(lc.ID), lc.TTL)
+	resp := &pb.LeaseCreateResponse{}
+	if err == nil {
+		resp.ID = int64(l.ID)
+		resp.TTL = l.TTL
+	}
+	return resp, err
 }
 
 func applyLeaseRevoke(le lease.Lessor, lc *pb.LeaseRevokeRequest) (*pb.LeaseRevokeResponse, error) {
@@ -482,4 +648,15 @@ func compareInt64(a, b int64) int {
 	default:
 		return 0
 	}
+}
+
+// isGteRange determines if the range end is a >= range. This works around grpc
+// sending empty byte strings as nil; >= is encoded in the range end as '\0'.
+func isGteRange(rangeEnd []byte) bool {
+	return len(rangeEnd) == 1 && rangeEnd[0] == 0
+}
+
+func applyAuthEnable(s *EtcdServer) (*pb.AuthEnableResponse, error) {
+	s.AuthStore().AuthEnable()
+	return &pb.AuthEnableResponse{}, nil
 }

@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// TODO: support arm64
+// +build amd64
+
 package etcdmain
 
 import (
@@ -32,12 +35,10 @@ import (
 	systemdutil "github.com/coreos/etcd/Godeps/_workspace/src/github.com/coreos/go-systemd/util"
 	"github.com/coreos/etcd/Godeps/_workspace/src/github.com/coreos/pkg/capnslog"
 	"github.com/coreos/etcd/Godeps/_workspace/src/github.com/prometheus/client_golang/prometheus"
-	"github.com/coreos/etcd/Godeps/_workspace/src/google.golang.org/grpc"
 	"github.com/coreos/etcd/discovery"
 	"github.com/coreos/etcd/etcdserver"
 	"github.com/coreos/etcd/etcdserver/api/v3rpc"
 	"github.com/coreos/etcd/etcdserver/etcdhttp"
-	"github.com/coreos/etcd/etcdserver/etcdserverpb"
 	"github.com/coreos/etcd/pkg/cors"
 	"github.com/coreos/etcd/pkg/fileutil"
 	pkgioutil "github.com/coreos/etcd/pkg/ioutil"
@@ -276,26 +277,27 @@ func startEtcd(cfg *config) (<-chan struct{}, error) {
 	}
 
 	srvcfg := &etcdserver.ServerConfig{
-		Name:                cfg.name,
-		ClientURLs:          cfg.acurls,
-		PeerURLs:            cfg.apurls,
-		DataDir:             cfg.dir,
-		DedicatedWALDir:     cfg.walDir,
-		SnapCount:           cfg.snapCount,
-		MaxSnapFiles:        cfg.maxSnapFiles,
-		MaxWALFiles:         cfg.maxWalFiles,
-		InitialPeerURLsMap:  urlsmap,
-		InitialClusterToken: token,
-		DiscoveryURL:        cfg.durl,
-		DiscoveryProxy:      cfg.dproxy,
-		NewCluster:          cfg.isNewCluster(),
-		ForceNewCluster:     cfg.forceNewCluster,
-		PeerTLSInfo:         cfg.peerTLSInfo,
-		TickMs:              cfg.TickMs,
-		ElectionTicks:       cfg.electionTicks(),
-		V3demo:              cfg.v3demo,
-		StrictReconfigCheck: cfg.strictReconfigCheck,
-		EnablePprof:         cfg.enablePprof,
+		Name:                    cfg.name,
+		ClientURLs:              cfg.acurls,
+		PeerURLs:                cfg.apurls,
+		DataDir:                 cfg.dir,
+		DedicatedWALDir:         cfg.walDir,
+		SnapCount:               cfg.snapCount,
+		MaxSnapFiles:            cfg.maxSnapFiles,
+		MaxWALFiles:             cfg.maxWalFiles,
+		InitialPeerURLsMap:      urlsmap,
+		InitialClusterToken:     token,
+		DiscoveryURL:            cfg.durl,
+		DiscoveryProxy:          cfg.dproxy,
+		NewCluster:              cfg.isNewCluster(),
+		ForceNewCluster:         cfg.forceNewCluster,
+		PeerTLSInfo:             cfg.peerTLSInfo,
+		TickMs:                  cfg.TickMs,
+		ElectionTicks:           cfg.electionTicks(),
+		V3demo:                  cfg.v3demo,
+		AutoCompactionRetention: cfg.autoCompactionRetention,
+		StrictReconfigCheck:     cfg.strictReconfigCheck,
+		EnablePprof:             cfg.enablePprof,
 	}
 	var s *etcdserver.EtcdServer
 	s, err = etcdserver.NewServer(srvcfg)
@@ -312,7 +314,7 @@ func startEtcd(cfg *config) (<-chan struct{}, error) {
 		Handler: etcdhttp.NewClientHandler(s, srvcfg.ReqTimeout()),
 		Info:    cfg.corsInfo,
 	}
-	ph := etcdhttp.NewPeerHandler(s.Cluster(), s.RaftHandler())
+	ph := etcdhttp.NewPeerHandler(s)
 	// Start the peer server in a goroutine
 	for _, l := range plns {
 		go func(l net.Listener) {
@@ -330,10 +332,16 @@ func startEtcd(cfg *config) (<-chan struct{}, error) {
 
 	if cfg.v3demo {
 		// set up v3 demo rpc
-		grpcServer := grpc.NewServer()
-		etcdserverpb.RegisterKVServer(grpcServer, v3rpc.NewKVServer(s))
-		etcdserverpb.RegisterWatchServer(grpcServer, v3rpc.NewWatchServer(s))
-		etcdserverpb.RegisterLeaseServer(grpcServer, v3rpc.NewLeaseServer(s))
+		tls := &cfg.clientTLSInfo
+		if cfg.clientTLSInfo.Empty() {
+			tls = nil
+		}
+		grpcServer, err := v3rpc.Server(s, tls)
+		if err != nil {
+			s.Stop()
+			<-s.StopNotify()
+			return nil, err
+		}
 		go func() { plog.Fatal(grpcServer.Serve(v3l)) }()
 	}
 
@@ -402,8 +410,8 @@ func startProxy(cfg *config) error {
 	clientURLs := []string{}
 	uf := func() []string {
 		gcls, err := etcdserver.GetClusterFromRemotePeers(peerURLs, tr)
-		// TODO: remove the 2nd check when we fix GetClusterFromPeers
-		// GetClusterFromPeers should not return nil error with an invalid empty cluster
+		// TODO: remove the 2nd check when we fix GetClusterFromRemotePeers
+		// GetClusterFromRemotePeers should not return nil error with an invalid empty cluster
 		if err != nil {
 			plog.Warningf("proxy: %v", err)
 			return []string{}

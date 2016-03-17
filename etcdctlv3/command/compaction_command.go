@@ -20,14 +20,12 @@ import (
 
 	"github.com/coreos/etcd/Godeps/_workspace/src/github.com/spf13/cobra"
 	"github.com/coreos/etcd/Godeps/_workspace/src/golang.org/x/net/context"
-	"github.com/coreos/etcd/Godeps/_workspace/src/google.golang.org/grpc"
-	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
 )
 
 // NewCompactionCommand returns the cobra command for "compaction".
 func NewCompactionCommand() *cobra.Command {
 	return &cobra.Command{
-		Use:   "compaction",
+		Use:   "compaction <revision>",
 		Short: "Compaction compacts the event history in etcd.",
 		Run:   compactionCommandFunc,
 	}
@@ -44,16 +42,10 @@ func compactionCommandFunc(cmd *cobra.Command, args []string) {
 		ExitWithError(ExitError, err)
 	}
 
-	endpoint, err := cmd.Flags().GetString("endpoint")
-	if err != nil {
-		ExitWithError(ExitError, err)
+	c := mustClientFromCmd(cmd)
+	if cerr := c.Compact(context.TODO(), rev); cerr != nil {
+		ExitWithError(ExitError, cerr)
+		return
 	}
-	conn, err := grpc.Dial(endpoint)
-	if err != nil {
-		ExitWithError(ExitBadConnection, err)
-	}
-	kv := pb.NewKVClient(conn)
-	req := &pb.CompactionRequest{Revision: rev}
-
-	kv.Compact(context.Background(), req)
+	fmt.Println("compacted revision", rev)
 }

@@ -207,13 +207,12 @@ func TestBlockProposal(t *testing.T) {
 	}
 
 	n.Campaign(context.TODO())
-	testutil.WaitSchedule()
 	select {
 	case err := <-errc:
 		if err != nil {
 			t.Errorf("err = %v, want %v", err, nil)
 		}
-	default:
+	case <-time.After(10 * time.Second):
 		t.Errorf("blocking proposal, want unblocking")
 	}
 }
@@ -330,6 +329,7 @@ func TestNodeStart(t *testing.T) {
 		MaxInflightMsgs: 256,
 	}
 	n := StartNode(c, []Peer{{ID: 1}})
+	defer n.Stop()
 	n.Campaign(ctx)
 	g := <-n.Ready()
 	if !reflect.DeepEqual(g, wants[0]) {
@@ -379,6 +379,7 @@ func TestNodeRestart(t *testing.T) {
 		MaxInflightMsgs: 256,
 	}
 	n := RestartNode(c)
+	defer n.Stop()
 	if g := <-n.Ready(); !reflect.DeepEqual(g, want) {
 		t.Errorf("g = %+v,\n             w   %+v", g, want)
 	}
@@ -423,6 +424,7 @@ func TestNodeRestartFromSnapshot(t *testing.T) {
 		MaxInflightMsgs: 256,
 	}
 	n := RestartNode(c)
+	defer n.Stop()
 	if g := <-n.Ready(); !reflect.DeepEqual(g, want) {
 		t.Errorf("g = %+v,\n             w   %+v", g, want)
 	} else {
@@ -450,6 +452,7 @@ func TestNodeAdvance(t *testing.T) {
 		MaxInflightMsgs: 256,
 	}
 	n := StartNode(c, []Peer{{ID: 1}})
+	defer n.Stop()
 	n.Campaign(ctx)
 	<-n.Ready()
 	n.Propose(ctx, []byte("foo"))

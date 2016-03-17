@@ -24,10 +24,17 @@ type KV interface {
 	// Rev returns the current revision of the KV.
 	Rev() int64
 
+	// FirstRev returns the first revision of the KV.
+	// After a compaction, the first revision increases to the compaction
+	// revision.
+	FirstRev() int64
+
 	// Range gets the keys in the range at rangeRev.
+	// The returned rev is the current revision of the KV when the operation is executed.
 	// If rangeRev <=0, range gets the keys at currentRev.
 	// If `end` is nil, the request returns the key.
-	// If `end` is not nil, it gets the keys in range [key, range_end).
+	// If `end` is not nil and not empty, it gets the keys in range [key, range_end).
+	// If `end` is not nil and empty, it gets the keys greater than or equal to key.
 	// Limit limits the number of keys returned.
 	// If the required rev is compacted, ErrCompacted will be returned.
 	Range(key, end []byte, limit, rangeRev int64) (kvs []storagepb.KeyValue, rev int64, err error)
@@ -36,11 +43,13 @@ type KV interface {
 	// attach a lease to a key-value pair as meta-data. KV implementation does not validate the lease
 	// id.
 	// A put also increases the rev of the store, and generates one event in the event history.
+	// The returned rev is the current revision of the KV when the operation is executed.
 	Put(key, value []byte, lease lease.LeaseID) (rev int64)
 
 	// DeleteRange deletes the given range from the store.
 	// A deleteRange increases the rev of the store if any key in the range exists.
 	// The number of key deleted will be returned.
+	// The returned rev is the current revision of the KV when the operation is executed.
 	// It also generates one event for each key delete in the event history.
 	// if the `end` is nil, deleteRange deletes the key.
 	// if the `end` is not nil, deleteRange deletes the keys in range [key, range_end).
@@ -53,13 +62,14 @@ type KV interface {
 	TxnBegin() int64
 	// TxnEnd ends the on-going txn with txn ID. If the on-going txn ID is not matched, error is returned.
 	TxnEnd(txnID int64) error
+	// TxnRange returns the current revision of the KV when the operation is executed.
 	TxnRange(txnID int64, key, end []byte, limit, rangeRev int64) (kvs []storagepb.KeyValue, rev int64, err error)
 	TxnPut(txnID int64, key, value []byte, lease lease.LeaseID) (rev int64, err error)
 	TxnDeleteRange(txnID int64, key, end []byte) (n, rev int64, err error)
 
 	Compact(rev int64) error
 
-	// Get the hash of KV state.
+	// Hash retrieves the hash of KV state.
 	// This method is designed for consistency checking purpose.
 	Hash() (uint32, error)
 

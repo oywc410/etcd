@@ -58,54 +58,54 @@ type Config struct {
 	// ID is the identity of the local raft. ID cannot be 0.
 	ID uint64
 
-	// peers contains the IDs of all nodes (including self) in
-	// the raft cluster. It should only be set when starting a new
-	// raft cluster.
-	// Restarting raft from previous configuration will panic if
-	// peers is set.
-	// peer is private and only used for testing right now.
+	// peers contains the IDs of all nodes (including self) in the raft cluster. It
+	// should only be set when starting a new raft cluster. Restarting raft from
+	// previous configuration will panic if peers is set. peer is private and only
+	// used for testing right now.
 	peers []uint64
 
-	// ElectionTick is the election timeout. If a follower does not
-	// receive any message from the leader of current term during
-	// ElectionTick, it will become candidate and start an election.
-	// ElectionTick must be greater than HeartbeatTick. We suggest
-	// to use ElectionTick = 10 * HeartbeatTick to avoid unnecessary
-	// leader switching.
+	// ElectionTick is the number of Node.Tick invocations that must pass between
+	// elections. That is, if a follower does not receive any message from the
+	// leader of current term before ElectionTick has elapsed, it will become
+	// candidate and start an election. ElectionTick must be greater than
+	// HeartbeatTick. We suggest ElectionTick = 10 * HeartbeatTick to avoid
+	// unnecessary leader switching.
 	ElectionTick int
-	// HeartbeatTick is the heartbeat interval. A leader sends heartbeat
-	// message to maintain the leadership every heartbeat interval.
+	// HeartbeatTick is the number of Node.Tick invocations that must pass between
+	// heartbeats. That is, a leader sends heartbeat messages to maintain its
+	// leadership every HeartbeatTick ticks.
 	HeartbeatTick int
 
-	// Storage is the storage for raft. raft generates entires and
-	// states to be stored in storage. raft reads the persisted entires
-	// and states out of Storage when it needs. raft reads out the previous
-	// state and configuration out of storage when restarting.
+	// Storage is the storage for raft. raft generates entries and states to be
+	// stored in storage. raft reads the persisted entries and states out of
+	// Storage when it needs. raft reads out the previous state and configuration
+	// out of storage when restarting.
 	Storage Storage
 	// Applied is the last applied index. It should only be set when restarting
-	// raft. raft will not return entries to the application smaller or equal to Applied.
-	// If Applied is unset when restarting, raft might return previous applied entries.
-	// This is a very application dependent configuration.
+	// raft. raft will not return entries to the application smaller or equal to
+	// Applied. If Applied is unset when restarting, raft might return previous
+	// applied entries. This is a very application dependent configuration.
 	Applied uint64
 
-	// MaxSizePerMsg limits the max size of each append message. Smaller value lowers
-	// the raft recovery cost(initial probing and message lost during normal operation).
-	// On the other side, it might affect the throughput during normal replication.
-	// Note: math.MaxUint64 for unlimited, 0 for at most one entry per message.
+	// MaxSizePerMsg limits the max size of each append message. Smaller value
+	// lowers the raft recovery cost(initial probing and message lost during normal
+	// operation). On the other side, it might affect the throughput during normal
+	// replication. Note: math.MaxUint64 for unlimited, 0 for at most one entry per
+	// message.
 	MaxSizePerMsg uint64
-	// MaxInflightMsgs limits the max number of in-flight append messages during optimistic
-	// replication phase. The application transportation layer usually has its own sending
-	// buffer over TCP/UDP. Setting MaxInflightMsgs to avoid overflowing that sending buffer.
-	// TODO (xiangli): feedback to application to limit the proposal rate?
+	// MaxInflightMsgs limits the max number of in-flight append messages during
+	// optimistic replication phase. The application transportation layer usually
+	// has its own sending buffer over TCP/UDP. Setting MaxInflightMsgs to avoid
+	// overflowing that sending buffer. TODO (xiangli): feedback to application to
+	// limit the proposal rate?
 	MaxInflightMsgs int
 
-	// CheckQuorum specifies if the leader should check quorum activity. Leader steps down when
-	// quorum is not active for an electionTimeout.
+	// CheckQuorum specifies if the leader should check quorum activity. Leader
+	// steps down when quorum is not active for an electionTimeout.
 	CheckQuorum bool
 
-	// logger is the logger used for raft log. For multinode which
-	// can host multiple raft group, each raft group can have its
-	// own logger
+	// Logger is the logger used for raft log. For multinode which can host
+	// multiple raft group, each raft group can have its own logger
 	Logger Logger
 }
 
@@ -138,9 +138,10 @@ func (c *Config) validate() error {
 }
 
 type raft struct {
-	pb.HardState
-
 	id uint64
+
+	Term uint64
+	Vote uint64
 
 	// the log
 	raftLog *raftLog
@@ -239,6 +240,14 @@ func (r *raft) hasLeader() bool { return r.lead != None }
 
 func (r *raft) softState() *SoftState { return &SoftState{Lead: r.lead, RaftState: r.state} }
 
+func (r *raft) hardState() pb.HardState {
+	return pb.HardState{
+		Term:   r.Term,
+		Vote:   r.Vote,
+		Commit: r.raftLog.committed,
+	}
+}
+
 func (r *raft) quorum() int { return len(r.prs)/2 + 1 }
 
 func (r *raft) nodes() []uint64 {
@@ -295,7 +304,7 @@ func (r *raft) sendAppend(to uint64) {
 		m.Snapshot = snapshot
 		sindex, sterm := snapshot.Metadata.Index, snapshot.Metadata.Term
 		r.logger.Debugf("%x [firstindex: %d, commit: %d] sent snapshot[index: %d, term: %d] to %x [%s]",
-			r.id, r.raftLog.firstIndex(), r.Commit, sindex, sterm, to, pr)
+			r.id, r.raftLog.firstIndex(), r.raftLog.committed, sindex, sterm, to, pr)
 		pr.becomeSnapshot(sindex)
 		r.logger.Debugf("%x paused sending replication messages to %x [%s]", r.id, to, pr)
 	} else {
@@ -360,6 +369,9 @@ func (r *raft) bcastHeartbeat() {
 	}
 }
 
+// maybeCommit attempts to advance the commit index. Returns true if
+// the commit index changed (in which case the caller should call
+// r.bcastAppend).
 func (r *raft) maybeCommit() bool {
 	// TODO(bmizerany): optimize.. Currently naive
 	mis := make(uint64Slice, 0, len(r.prs))
@@ -399,6 +411,7 @@ func (r *raft) appendEntry(es ...pb.Entry) {
 	}
 	r.raftLog.append(es...)
 	r.prs[r.id].maybeUpdate(r.raftLog.lastIndex())
+	// Regardless of maybeCommit's return, our caller will call bcastAppend.
 	r.maybeCommit()
 }
 
@@ -525,7 +538,6 @@ func (r *raft) Step(m pb.Message) error {
 		if r.state != StateLeader {
 			r.logger.Infof("%x is starting a new election at term %d", r.id, r.Term)
 			r.campaign()
-			r.Commit = r.raftLog.committed
 		} else {
 			r.logger.Debugf("%x ignoring MsgHup because already leader", r.id)
 		}
@@ -550,7 +562,6 @@ func (r *raft) Step(m pb.Message) error {
 		return nil
 	}
 	r.step(r, m)
-	r.Commit = r.raftLog.committed
 	return nil
 }
 
@@ -742,8 +753,8 @@ func stepFollower(r *raft, m pb.Message) {
 }
 
 func (r *raft) handleAppendEntries(m pb.Message) {
-	if m.Index < r.Commit {
-		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.Commit})
+	if m.Index < r.raftLog.committed {
+		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.committed})
 		return
 	}
 
@@ -765,11 +776,11 @@ func (r *raft) handleSnapshot(m pb.Message) {
 	sindex, sterm := m.Snapshot.Metadata.Index, m.Snapshot.Metadata.Term
 	if r.restore(m.Snapshot) {
 		r.logger.Infof("%x [commit: %d] restored snapshot [index: %d, term: %d]",
-			r.id, r.Commit, sindex, sterm)
+			r.id, r.raftLog.committed, sindex, sterm)
 		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.lastIndex()})
 	} else {
 		r.logger.Infof("%x [commit: %d] ignored snapshot [index: %d, term: %d]",
-			r.id, r.Commit, sindex, sterm)
+			r.id, r.raftLog.committed, sindex, sterm)
 		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.committed})
 	}
 }
@@ -782,13 +793,13 @@ func (r *raft) restore(s pb.Snapshot) bool {
 	}
 	if r.raftLog.matchTerm(s.Metadata.Index, s.Metadata.Term) {
 		r.logger.Infof("%x [commit: %d, lastindex: %d, lastterm: %d] fast-forwarded commit to snapshot [index: %d, term: %d]",
-			r.id, r.Commit, r.raftLog.lastIndex(), r.raftLog.lastTerm(), s.Metadata.Index, s.Metadata.Term)
+			r.id, r.raftLog.committed, r.raftLog.lastIndex(), r.raftLog.lastTerm(), s.Metadata.Index, s.Metadata.Term)
 		r.raftLog.commitTo(s.Metadata.Index)
 		return false
 	}
 
 	r.logger.Infof("%x [commit: %d, lastindex: %d, lastterm: %d] starts to restore snapshot [index: %d, term: %d]",
-		r.id, r.Commit, r.raftLog.lastIndex(), r.raftLog.lastTerm(), s.Metadata.Index, s.Metadata.Term)
+		r.id, r.raftLog.committed, r.raftLog.lastIndex(), r.raftLog.lastTerm(), s.Metadata.Index, s.Metadata.Term)
 
 	r.raftLog.restore(s)
 	r.prs = make(map[uint64]*Progress)
@@ -826,6 +837,11 @@ func (r *raft) addNode(id uint64) {
 func (r *raft) removeNode(id uint64) {
 	r.delProgress(id)
 	r.pendingConf = false
+	// The quorum size is now smaller, so see if any pending entries can
+	// be committed.
+	if r.maybeCommit() {
+		r.bcastAppend()
+	}
 }
 
 func (r *raft) resetPendingConf() { r.pendingConf = false }
@@ -845,10 +861,9 @@ func (r *raft) loadState(state pb.HardState) {
 	r.raftLog.committed = state.Commit
 	r.Term = state.Term
 	r.Vote = state.Vote
-	r.Commit = state.Commit
 }
 
-// isElectionTimeout returns true if r.elapsed is greater than the
+// isElectionTimeout returns true if r.electionElapsed is greater than the
 // randomized election timeout in (electiontimeout, 2 * electiontimeout - 1).
 // Otherwise, it returns false.
 func (r *raft) isElectionTimeout() bool {

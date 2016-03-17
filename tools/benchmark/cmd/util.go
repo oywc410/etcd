@@ -18,9 +18,8 @@ import (
 	"crypto/rand"
 	"fmt"
 	"os"
-	"strings"
 
-	"github.com/coreos/etcd/Godeps/_workspace/src/google.golang.org/grpc"
+	"github.com/coreos/etcd/clientv3"
 )
 
 var (
@@ -29,16 +28,38 @@ var (
 	dialTotal int
 )
 
-func mustCreateConn() *grpc.ClientConn {
-	eps := strings.Split(endpoints, ",")
-	endpoint := eps[dialTotal%len(eps)]
+func mustCreateConn() *clientv3.Client {
+	endpoint := endpoints[dialTotal%len(endpoints)]
 	dialTotal++
-	conn, err := grpc.Dial(endpoint)
+	cfg := clientv3.Config{Endpoints: []string{endpoint}}
+	if !tls.Empty() {
+		cfgtls, err := tls.ClientConfig()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "bad tls config: %v\n", err)
+			os.Exit(1)
+		}
+		cfg.TLS = cfgtls
+	}
+
+	client, err := clientv3.New(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "dial error: %v\n", err)
 		os.Exit(1)
 	}
-	return conn
+	return client
+}
+
+func mustCreateClients(totalClients, totalConns uint) []*clientv3.Client {
+	conns := make([]*clientv3.Client, totalConns)
+	for i := range conns {
+		conns[i] = mustCreateConn()
+	}
+
+	clients := make([]*clientv3.Client, totalClients)
+	for i := range clients {
+		clients[i] = conns[i%int(totalConns)]
+	}
+	return clients
 }
 
 func mustRandBytes(n int) []byte {

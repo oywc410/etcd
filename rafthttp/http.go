@@ -20,6 +20,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"path"
+	"strings"
 
 	"github.com/coreos/etcd/Godeps/_workspace/src/golang.org/x/net/context"
 	pioutil "github.com/coreos/etcd/pkg/ioutil"
@@ -58,6 +59,7 @@ type writerToResponse interface {
 }
 
 type pipelineHandler struct {
+	tr  Transporter
 	r   Raft
 	cid types.ID
 }
@@ -67,8 +69,9 @@ type pipelineHandler struct {
 //
 // The handler reads out the raft message from request body,
 // and forwards it to the given raft state machine for processing.
-func newPipelineHandler(r Raft, cid types.ID) http.Handler {
+func newPipelineHandler(tr Transporter, r Raft, cid types.ID) http.Handler {
 	return &pipelineHandler{
+		tr:  tr,
 		r:   r,
 		cid: cid,
 	}
@@ -86,6 +89,12 @@ func (h *pipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err := checkClusterCompatibilityFromHeader(r.Header, h.cid); err != nil {
 		http.Error(w, err.Error(), http.StatusPreconditionFailed)
 		return
+	}
+
+	if from, err := types.IDFromString(r.Header.Get("X-Server-From")); err != nil {
+		if urls := r.Header.Get("X-PeerURLs"); urls != "" {
+			h.tr.AddRemote(from, strings.Split(urls, ","))
+		}
 	}
 
 	// Limit the data size that could be read from the request body, which ensures that read from
@@ -113,19 +122,22 @@ func (h *pipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	// Write StatusNoContet header after the message has been processed by
+
+	// Write StatusNoContent header after the message has been processed by
 	// raft, which facilitates the client to report MsgSnap status.
 	w.WriteHeader(http.StatusNoContent)
 }
 
 type snapshotHandler struct {
+	tr          Transporter
 	r           Raft
 	snapshotter *snap.Snapshotter
 	cid         types.ID
 }
 
-func newSnapshotHandler(r Raft, snapshotter *snap.Snapshotter, cid types.ID) http.Handler {
+func newSnapshotHandler(tr Transporter, r Raft, snapshotter *snap.Snapshotter, cid types.ID) http.Handler {
 	return &snapshotHandler{
+		tr:          tr,
 		r:           r,
 		snapshotter: snapshotter,
 		cid:         cid,
@@ -153,6 +165,12 @@ func (h *snapshotHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err := checkClusterCompatibilityFromHeader(r.Header, h.cid); err != nil {
 		http.Error(w, err.Error(), http.StatusPreconditionFailed)
 		return
+	}
+
+	if from, err := types.IDFromString(r.Header.Get("X-Server-From")); err != nil {
+		if urls := r.Header.Get("X-PeerURLs"); urls != "" {
+			h.tr.AddRemote(from, strings.Split(urls, ","))
+		}
 	}
 
 	dec := &messageDecoder{r: r.Body}
@@ -192,21 +210,23 @@ func (h *snapshotHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	// Write StatusNoContet header after the message has been processed by
+	// Write StatusNoContent header after the message has been processed by
 	// raft, which facilitates the client to report MsgSnap status.
 	w.WriteHeader(http.StatusNoContent)
 }
 
 type streamHandler struct {
+	tr         *Transport
 	peerGetter peerGetter
 	r          Raft
 	id         types.ID
 	cid        types.ID
 }
 
-func newStreamHandler(peerGetter peerGetter, r Raft, id, cid types.ID) http.Handler {
+func newStreamHandler(tr *Transport, pg peerGetter, r Raft, id, cid types.ID) http.Handler {
 	return &streamHandler{
-		peerGetter: peerGetter,
+		tr:         tr,
+		peerGetter: pg,
 		r:          r,
 		id:         id,
 		cid:        cid,
@@ -259,6 +279,9 @@ func (h *streamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// with the same cluster ID.
 		// 2. local etcd falls behind of the cluster, and cannot recognize
 		// the members that joined after its current progress.
+		if urls := r.Header.Get("X-PeerURLs"); urls != "" {
+			h.tr.AddRemote(from, strings.Split(urls, ","))
+		}
 		plog.Errorf("failed to find member %s in cluster %s", from, h.cid)
 		http.Error(w, "error sender not found", http.StatusNotFound)
 		return

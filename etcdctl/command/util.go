@@ -66,7 +66,15 @@ func argOrStdin(args []string, stdin io.Reader, i int) (string, error) {
 }
 
 func getPeersFlagValue(c *cli.Context) []string {
-	peerstr := c.GlobalString("endpoint")
+	peerstr := c.GlobalString("endpoints")
+
+	if peerstr == "" {
+		peerstr = os.Getenv("ETCDCTL_ENDPOINTS")
+	}
+
+	if peerstr == "" {
+		peerstr = c.GlobalString("endpoint")
+	}
 
 	if peerstr == "" {
 		peerstr = os.Getenv("ETCDCTL_ENDPOINT")
@@ -82,7 +90,7 @@ func getPeersFlagValue(c *cli.Context) []string {
 
 	// If we still don't have peers, use a default
 	if peerstr == "" {
-		peerstr = "http://127.0.0.1:4001,http://127.0.0.1:2379"
+		peerstr = "http://127.0.0.1:2379,http://127.0.0.1:4001"
 	}
 
 	return strings.Split(peerstr, ",")
@@ -164,11 +172,15 @@ func getTransport(c *cli.Context) (*http.Transport, error) {
 }
 
 func getUsernamePasswordFromFlag(usernameFlag string) (username string, password string, err error) {
+	return getUsernamePassword("Password: ", usernameFlag)
+}
+
+func getUsernamePassword(prompt, usernameFlag string) (username string, password string, err error) {
 	colon := strings.Index(usernameFlag, ":")
 	if colon == -1 {
 		username = usernameFlag
 		// Prompt for the password.
-		password, err = speakeasy.Ask("Password: ")
+		password, err = speakeasy.Ask(prompt)
 		if err != nil {
 			return "", "", err
 		}

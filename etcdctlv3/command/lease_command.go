@@ -16,15 +16,12 @@ package command
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"strconv"
-	"time"
 
 	"github.com/coreos/etcd/Godeps/_workspace/src/github.com/spf13/cobra"
 	"github.com/coreos/etcd/Godeps/_workspace/src/golang.org/x/net/context"
-	"github.com/coreos/etcd/Godeps/_workspace/src/google.golang.org/grpc"
-	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
+	"github.com/coreos/etcd/lease"
 )
 
 // NewLeaseCommand returns the cobra command for "lease".
@@ -64,18 +61,7 @@ func leaseCreateCommandFunc(cmd *cobra.Command, args []string) {
 		ExitWithError(ExitBadArgs, fmt.Errorf("bad TTL (%v)", err))
 	}
 
-	endpoint, err := cmd.Flags().GetString("endpoint")
-	if err != nil {
-		ExitWithError(ExitError, err)
-	}
-	conn, err := grpc.Dial(endpoint)
-	if err != nil {
-		ExitWithError(ExitBadConnection, err)
-	}
-	lease := pb.NewLeaseClient(conn)
-
-	req := &pb.LeaseCreateRequest{TTL: ttl}
-	resp, err := lease.LeaseCreate(context.Background(), req)
+	resp, err := mustClientFromCmd(cmd).Create(context.TODO(), ttl)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create lease (%v)\n", err)
 		return
@@ -106,18 +92,7 @@ func leaseRevokeCommandFunc(cmd *cobra.Command, args []string) {
 		ExitWithError(ExitBadArgs, fmt.Errorf("bad lease ID arg (%v), expecting ID in Hex", err))
 	}
 
-	endpoint, err := cmd.Flags().GetString("endpoint")
-	if err != nil {
-		ExitWithError(ExitError, err)
-	}
-	conn, err := grpc.Dial(endpoint)
-	if err != nil {
-		ExitWithError(ExitBadConnection, err)
-	}
-	lease := pb.NewLeaseClient(conn)
-
-	req := &pb.LeaseRevokeRequest{ID: id}
-	_, err = lease.LeaseRevoke(context.Background(), req)
+	_, err = mustClientFromCmd(cmd).Revoke(context.TODO(), lease.LeaseID(id))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to revoke lease (%v)\n", err)
 		return
@@ -148,45 +123,13 @@ func leaseKeepAliveCommandFunc(cmd *cobra.Command, args []string) {
 		ExitWithError(ExitBadArgs, fmt.Errorf("bad lease ID arg (%v), expecting ID in Hex", err))
 	}
 
-	endpoint, err := cmd.Flags().GetString("endpoint")
-	if err != nil {
-		ExitWithError(ExitError, err)
-	}
-	conn, err := grpc.Dial(endpoint)
-	if err != nil {
-		ExitWithError(ExitBadConnection, err)
-	}
-	lease := pb.NewLeaseClient(conn)
-	kStream, err := lease.LeaseKeepAlive(context.TODO())
-	if err != nil {
-		ExitWithError(ExitBadConnection, err)
+	respc, kerr := mustClientFromCmd(cmd).KeepAlive(context.TODO(), lease.LeaseID(id))
+	if kerr != nil {
+		ExitWithError(ExitBadConnection, kerr)
 	}
 
-	nextC := make(chan int64, 1)
-	go leaseKeepAliveRecvLoop(kStream, nextC)
-
-	req := &pb.LeaseKeepAliveRequest{ID: id}
-	for {
-		err := kStream.Send(req)
-		if err != nil {
-			ExitWithError(ExitError, fmt.Errorf("failed to keep-alive lease (%v)", err))
-		}
-		next := <-nextC
-		time.Sleep(time.Duration(next/2) * time.Second)
-	}
-}
-
-func leaseKeepAliveRecvLoop(kStream pb.Lease_LeaseKeepAliveClient, nextC chan int64) {
-	for {
-		resp, err := kStream.Recv()
-		if err == io.EOF {
-			os.Exit(ExitSuccess)
-		}
-		if err != nil {
-			ExitWithError(ExitError, err)
-		}
-
+	for resp := range respc {
 		fmt.Printf("lease %016x keepalived with TTL(%d)\n", resp.ID, resp.TTL)
-		nextC <- resp.TTL
 	}
+	fmt.Printf("lease %016x expired or revoked.\n", id)
 }

@@ -28,6 +28,7 @@ type BatchTx interface {
 	Unlock()
 	UnsafeCreateBucket(name []byte)
 	UnsafePut(bucketName []byte, key []byte, value []byte)
+	UnsafeSeqPut(bucketName []byte, key []byte, value []byte)
 	UnsafeRange(bucketName []byte, key, endKey []byte, limit int64) (keys [][]byte, vals [][]byte)
 	UnsafeDelete(bucketName []byte, key []byte)
 	Commit()
@@ -55,11 +56,25 @@ func (t *batchTx) UnsafeCreateBucket(name []byte) {
 	t.pending++
 }
 
-// before calling unsafePut, the caller MUST hold the lock on tx.
+// UnsafePut must be called holding the lock on the tx.
 func (t *batchTx) UnsafePut(bucketName []byte, key []byte, value []byte) {
+	t.unsafePut(bucketName, key, value, false)
+}
+
+// UnsafeSeqPut must be called holding the lock on the tx.
+func (t *batchTx) UnsafeSeqPut(bucketName []byte, key []byte, value []byte) {
+	t.unsafePut(bucketName, key, value, true)
+}
+
+func (t *batchTx) unsafePut(bucketName []byte, key []byte, value []byte, seq bool) {
 	bucket := t.tx.Bucket(bucketName)
 	if bucket == nil {
 		log.Fatalf("storage: bucket %s does not exist", string(bucketName))
+	}
+	if seq {
+		// it is useful to increase fill percent when the workloads are mostly append-only.
+		// this can delay the page split and reduce space usage.
+		bucket.FillPercent = 0.9
 	}
 	if err := bucket.Put(key, value); err != nil {
 		log.Fatalf("storage: cannot put key into bucket (%v)", err)
@@ -67,7 +82,7 @@ func (t *batchTx) UnsafePut(bucketName []byte, key []byte, value []byte) {
 	t.pending++
 }
 
-// before calling unsafeRange, the caller MUST hold the lock on tx.
+// UnsafeRange must be called holding the lock on the tx.
 func (t *batchTx) UnsafeRange(bucketName []byte, key, endKey []byte, limit int64) (keys [][]byte, vs [][]byte) {
 	bucket := t.tx.Bucket(bucketName)
 	if bucket == nil {
@@ -94,7 +109,7 @@ func (t *batchTx) UnsafeRange(bucketName []byte, key, endKey []byte, limit int64
 	return keys, vs
 }
 
-// before calling unsafeDelete, the caller MUST hold the lock on tx.
+// UnsafeDelete must be called holding the lock on the tx.
 func (t *batchTx) UnsafeDelete(bucketName []byte, key []byte) {
 	bucket := t.tx.Bucket(bucketName)
 	if bucket == nil {
@@ -149,6 +164,8 @@ func (t *batchTx) commit(stop bool) {
 		return
 	}
 
+	t.backend.mu.RLock()
+	defer t.backend.mu.RUnlock()
 	// begin a new tx
 	t.tx, err = t.backend.db.Begin(true)
 	if err != nil {

@@ -46,17 +46,19 @@ type ServerConfig struct {
 	ForceNewCluster     bool
 	PeerTLSInfo         transport.TLSInfo
 
-	TickMs        uint
-	ElectionTicks int
+	TickMs           uint
+	ElectionTicks    int
+	BootstrapTimeout time.Duration
 
-	V3demo bool
+	V3demo                  bool
+	AutoCompactionRetention int
 
 	StrictReconfigCheck bool
 
 	EnablePprof bool
 }
 
-// VerifyBootstrapConfig sanity-checks the initial config for bootstrap case
+// VerifyBootstrap sanity-checks the initial config for bootstrap case
 // and returns an error for things that should never happen.
 func (c *ServerConfig) VerifyBootstrap() error {
 	if err := c.verifyLocalMember(true); err != nil {
@@ -132,6 +134,10 @@ func (c *ServerConfig) ReqTimeout() time.Duration {
 	return 5*time.Second + 2*time.Duration(c.ElectionTicks)*time.Duration(c.TickMs)*time.Millisecond
 }
 
+func (c *ServerConfig) electionTimeout() time.Duration {
+	return time.Duration(c.ElectionTicks) * time.Duration(c.TickMs) * time.Millisecond
+}
+
 func (c *ServerConfig) peerDialTimeout() time.Duration {
 	// 1s for queue wait and system delay
 	// + one RTT, which is smaller than 1/5 election timeout
@@ -180,4 +186,11 @@ func checkDuplicateURL(urlsmap types.URLsMap) bool {
 		}
 	}
 	return false
+}
+
+func (c *ServerConfig) bootstrapTimeout() time.Duration {
+	if c.BootstrapTimeout != 0 {
+		return c.BootstrapTimeout
+	}
+	return time.Second
 }

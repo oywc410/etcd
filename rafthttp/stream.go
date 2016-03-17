@@ -95,8 +95,7 @@ type outgoingConn struct {
 	io.Closer
 }
 
-// streamWriter is a long-running go-routine that writes messages into the
-// attached outgoingConn.
+// streamWriter writes messages to the attached outgoingConn.
 type streamWriter struct {
 	id     types.ID
 	status *peerStatus
@@ -113,6 +112,8 @@ type streamWriter struct {
 	done  chan struct{}
 }
 
+// startStreamWriter creates a streamWrite and starts a long running go-routine that accepts
+// messages and writes to the attached outgoing connection.
 func startStreamWriter(id types.ID, status *peerStatus, fs *stats.FollowerStats, r Raft) *streamWriter {
 	w := &streamWriter{
 		id:     id,
@@ -129,40 +130,54 @@ func startStreamWriter(id types.ID, status *peerStatus, fs *stats.FollowerStats,
 }
 
 func (cw *streamWriter) run() {
-	var msgc chan raftpb.Message
-	var heartbeatc <-chan time.Time
-	var t streamType
-	var enc encoder
-	var flusher http.Flusher
+	var (
+		msgc       chan raftpb.Message
+		heartbeatc <-chan time.Time
+		t          streamType
+		enc        encoder
+		flusher    http.Flusher
+		batched    int
+	)
 	tickc := time.Tick(ConnReadTimeout / 3)
 
 	for {
 		select {
 		case <-heartbeatc:
 			start := time.Now()
-			if err := enc.encode(linkHeartbeatMessage); err != nil {
-				reportSentFailure(string(t), linkHeartbeatMessage)
-
-				cw.status.deactivate(failureType{source: t.String(), action: "heartbeat"}, err.Error())
-				cw.close()
-				heartbeatc, msgc = nil, nil
+			err := enc.encode(linkHeartbeatMessage)
+			if err == nil {
+				flusher.Flush()
+				batched = 0
+				reportSentDuration(string(t), linkHeartbeatMessage, time.Since(start))
 				continue
 			}
-			flusher.Flush()
-			reportSentDuration(string(t), linkHeartbeatMessage, time.Since(start))
+
+			reportSentFailure(string(t), linkHeartbeatMessage)
+			cw.status.deactivate(failureType{source: t.String(), action: "heartbeat"}, err.Error())
+			cw.close()
+			heartbeatc, msgc = nil, nil
+
 		case m := <-msgc:
 			start := time.Now()
-			if err := enc.encode(m); err != nil {
-				reportSentFailure(string(t), m)
+			err := enc.encode(m)
+			if err == nil {
+				if len(msgc) == 0 || batched > streamBufSize/2 {
+					flusher.Flush()
+					batched = 0
+				} else {
+					batched++
+				}
 
-				cw.status.deactivate(failureType{source: t.String(), action: "write"}, err.Error())
-				cw.close()
-				heartbeatc, msgc = nil, nil
-				cw.r.ReportUnreachable(m.To)
+				reportSentDuration(string(t), m, time.Since(start))
 				continue
 			}
-			flusher.Flush()
-			reportSentDuration(string(t), m, time.Since(start))
+
+			reportSentFailure(string(t), m)
+			cw.status.deactivate(failureType{source: t.String(), action: "write"}, err.Error())
+			cw.close()
+			heartbeatc, msgc = nil, nil
+			cw.r.ReportUnreachable(m.To)
+
 		case conn := <-cw.connc:
 			cw.close()
 			t = conn.t
@@ -226,7 +241,7 @@ func (cw *streamWriter) stop() {
 // streamReader is a long-running go-routine that dials to the remote stream
 // endpoint and reads messages from the response body returned.
 type streamReader struct {
-	tr            http.RoundTripper
+	tr            *Transport
 	picker        *urlPicker
 	t             streamType
 	local, remote types.ID
@@ -243,7 +258,7 @@ type streamReader struct {
 	done   chan struct{}
 }
 
-func startStreamReader(tr http.RoundTripper, picker *urlPicker, t streamType, local, remote, cid types.ID, status *peerStatus, recvc chan<- raftpb.Message, propc chan<- raftpb.Message, errorc chan<- error) *streamReader {
+func startStreamReader(tr *Transport, picker *urlPicker, t streamType, local, remote, cid types.ID, status *peerStatus, recvc chan<- raftpb.Message, propc chan<- raftpb.Message, errorc chan<- error) *streamReader {
 	r := &streamReader{
 		tr:     tr,
 		picker: picker,
@@ -372,6 +387,8 @@ func (cr *streamReader) dial(t streamType) (io.ReadCloser, error) {
 	req.Header.Set("X-Etcd-Cluster-ID", cr.cid.String())
 	req.Header.Set("X-Raft-To", cr.remote.String())
 
+	setPeerURLsHeader(req, cr.tr.URLs)
+
 	cr.mu.Lock()
 	select {
 	case <-cr.stopc:
@@ -379,10 +396,10 @@ func (cr *streamReader) dial(t streamType) (io.ReadCloser, error) {
 		return nil, fmt.Errorf("stream reader is stopped")
 	default:
 	}
-	cr.cancel = httputil.RequestCanceler(cr.tr, req)
+	cr.cancel = httputil.RequestCanceler(cr.tr.streamRt, req)
 	cr.mu.Unlock()
 
-	resp, err := cr.tr.RoundTrip(req)
+	resp, err := cr.tr.streamRt.RoundTrip(req)
 	if err != nil {
 		cr.picker.unreachable(u)
 		return nil, err

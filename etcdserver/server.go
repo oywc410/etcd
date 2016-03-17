@@ -24,12 +24,15 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/coreos/etcd/Godeps/_workspace/src/github.com/coreos/go-semver/semver"
 	"github.com/coreos/etcd/Godeps/_workspace/src/github.com/coreos/pkg/capnslog"
 	"github.com/coreos/etcd/Godeps/_workspace/src/golang.org/x/net/context"
+	"github.com/coreos/etcd/auth"
+	"github.com/coreos/etcd/compactor"
 	"github.com/coreos/etcd/discovery"
 	"github.com/coreos/etcd/etcdserver/etcdhttp/httptypes"
 	pb "github.com/coreos/etcd/etcdserver/etcdserverpb"
@@ -39,7 +42,7 @@ import (
 	"github.com/coreos/etcd/pkg/idutil"
 	"github.com/coreos/etcd/pkg/pbutil"
 	"github.com/coreos/etcd/pkg/runtime"
-	"github.com/coreos/etcd/pkg/timeutil"
+	"github.com/coreos/etcd/pkg/schedule"
 	"github.com/coreos/etcd/pkg/types"
 	"github.com/coreos/etcd/pkg/wait"
 	"github.com/coreos/etcd/raft"
@@ -62,8 +65,11 @@ const (
 	StoreClusterPrefix = "/0"
 	StoreKeysPrefix    = "/1"
 
-	purgeFileInterval      = 30 * time.Second
-	monitorVersionInterval = 5 * time.Second
+	purgeFileInterval = 30 * time.Second
+	// monitorVersionInterval should be smaller than the timeout
+	// on the connection. Or we will not be able to reuse the connection
+	// (since it will timeout).
+	monitorVersionInterval = rafthttp.ConnWriteTimeout - time.Second
 
 	databaseFilename = "db"
 	// max number of in-flight snapshot messages etcdserver allows to have
@@ -131,7 +137,7 @@ type Server interface {
 	UpdateMember(ctx context.Context, updateMemb Member) error
 
 	// ClusterVersion is the cluster-wide minimum major.minor version.
-	// Cluster version is set to the min version that a etcd member is
+	// Cluster version is set to the min version that an etcd member is
 	// compatible with when first bootstrap.
 	//
 	// ClusterVersion is nil until the cluster is bootstrapped (has a quorum).
@@ -167,21 +173,26 @@ type EtcdServer struct {
 
 	store store.Store
 
-	kv     dstorage.ConsistentWatchableKV
-	lessor lease.Lessor
-	be     backend.Backend
+	kv        dstorage.ConsistentWatchableKV
+	lessor    lease.Lessor
+	bemu      sync.Mutex
+	be        backend.Backend
+	authStore auth.AuthStore
 
 	stats  *stats.ServerStats
 	lstats *stats.LeaderStats
 
 	SyncTicker <-chan time.Time
+	// compactor is used to auto-compact the KV.
+	compactor *compactor.Periodic
 
 	// consistent index used to hold the offset of current executing entry
 	// It is initialized to 0 before executing any entry.
 	consistIndex consistentIndex
-	// versionRt used to send requests for peer version
-	versionRt http.RoundTripper
-	reqIDGen  *idutil.Generator
+
+	// peerRt used to send requests (version, lease) to peers.
+	peerRt   http.RoundTripper
+	reqIDGen *idutil.Generator
 
 	// forceVersionC is used to force the version monitor loop
 	// to detect the cluster version immediately.
@@ -265,7 +276,7 @@ func NewServer(cfg *ServerConfig) (*EtcdServer, error) {
 			return nil, err
 		}
 		m := cl.MemberByName(cfg.Name)
-		if isMemberBootstrapped(cl, cfg.Name, prt) {
+		if isMemberBootstrapped(cl, cfg.Name, prt, cfg.bootstrapTimeout()) {
 			return nil, fmt.Errorf("member %s has already been bootstrapped", m.ID)
 		}
 		if cfg.ShouldDiscover() {
@@ -353,16 +364,21 @@ func NewServer(cfg *ServerConfig) (*EtcdServer, error) {
 		stats:         sstats,
 		lstats:        lstats,
 		SyncTicker:    time.Tick(500 * time.Millisecond),
-		versionRt:     prt,
-		reqIDGen:      idutil.NewGenerator(uint8(id), time.Now()),
+		peerRt:        prt,
+		reqIDGen:      idutil.NewGenerator(uint16(id), time.Now()),
 		forceVersionC: make(chan struct{}),
 		msgSnapC:      make(chan raftpb.Message, maxInFlightMsgSnap),
 	}
 
 	if cfg.V3demo {
 		srv.be = backend.NewDefaultBackend(path.Join(cfg.SnapDir(), databaseFilename))
-		srv.lessor = lease.NewLessor(uint8(id), srv.be)
+		srv.lessor = lease.NewLessor(srv.be)
 		srv.kv = dstorage.New(srv.be, srv.lessor, &srv.consistIndex)
+		srv.authStore = auth.NewAuthStore(srv)
+		if h := cfg.AutoCompactionRetention; h != 0 {
+			srv.compactor = compactor.NewPeriodic(h, srv.kv, srv)
+			srv.compactor.Run()
+		}
 	}
 
 	// TODO: move transport initialization near the definition of remote
@@ -370,6 +386,7 @@ func NewServer(cfg *ServerConfig) (*EtcdServer, error) {
 		TLSInfo:     cfg.PeerTLSInfo,
 		DialTimeout: cfg.peerDialTimeout(),
 		ID:          id,
+		URLs:        cfg.PeerURLs,
 		ClusterID:   cl.ID(),
 		Raft:        srv,
 		Snapshotter: ss,
@@ -453,6 +470,8 @@ func (s *EtcdServer) Cluster() Cluster { return s.cluster }
 
 func (s *EtcdServer) RaftHandler() http.Handler { return s.r.transport.Handler() }
 
+func (s *EtcdServer) Lessor() lease.Lessor { return s.lessor }
+
 func (s *EtcdServer) Process(ctx context.Context, m raftpb.Message) error {
 	if s.cluster.IsIDRemoved(types.ID(m.From)) {
 		plog.Warningf("reject message from removed member %s", types.ID(m.From).String())
@@ -480,51 +499,6 @@ type etcdProgress struct {
 	appliedi  uint64
 }
 
-// newApplier buffers apply operations so raftNode won't block on sending
-// new applies, timing out (since applies can be slow). The goroutine begins
-// shutdown on close(s.done) and closes the returned channel when finished.
-func (s *EtcdServer) startApplier(ep etcdProgress) <-chan struct{} {
-	donec := make(chan struct{})
-	go func() {
-		defer close(donec)
-		pending := []apply{}
-		sdonec := s.done
-		apdonec := make(chan struct{})
-		// serialized function
-		f := func(ap apply) {
-			s.applyAll(&ep, &ap)
-			select {
-			// snapshot requested via send()
-			case m := <-s.msgSnapC:
-				merged := s.createMergedSnapshotMessage(m, ep.appliedi, ep.confState)
-				s.sendMergedSnap(merged)
-			default:
-			}
-			apdonec <- struct{}{}
-		}
-		for sdonec != nil || len(pending) > 0 {
-			select {
-			// launch if no pending apply packet, queue up the rest
-			case ap := <-s.r.apply():
-				pending = append(pending, ap)
-				if len(pending) == 1 {
-					go f(pending[0])
-				}
-			// pending apply serviced, schedule the next one
-			case <-apdonec:
-				pending = pending[1:]
-				if len(pending) != 0 {
-					go f(pending[0])
-				}
-			// run() is finished; drain pending and exit
-			case <-sdonec:
-				sdonec = nil
-			}
-		}
-	}()
-	return donec
-}
-
 func (s *EtcdServer) run() {
 	snap, err := s.r.raftStorage.Snapshot()
 	if err != nil {
@@ -533,14 +507,17 @@ func (s *EtcdServer) run() {
 	s.r.start(s)
 
 	// asynchronously accept apply packets, dispatch progress in-order
-	appdonec := s.startApplier(etcdProgress{
+	sched := schedule.NewFIFOScheduler()
+	ep := etcdProgress{
 		confState: snap.Metadata.ConfState,
 		snapi:     snap.Metadata.Index,
 		appliedi:  snap.Metadata.Index,
-	})
+	}
 
 	defer func() {
 		s.r.stop()
+		sched.Stop()
+
 		// kv, lessor and backend can be nil if running without v3 enabled
 		// or running unit tests.
 		if s.lessor != nil {
@@ -552,8 +529,10 @@ func (s *EtcdServer) run() {
 		if s.be != nil {
 			s.be.Close()
 		}
+		if s.compactor != nil {
+			s.compactor.Stop()
+		}
 		close(s.done)
-		<-appdonec
 	}()
 
 	var expiredLeaseC <-chan []*lease.Lease
@@ -563,6 +542,9 @@ func (s *EtcdServer) run() {
 
 	for {
 		select {
+		case ap := <-s.r.apply():
+			f := func(context.Context) { s.applyAll(&ep, &ap) }
+			sched.Schedule(f)
 		case leases := <-expiredLeaseC:
 			go func() {
 				for _, l := range leases {
@@ -587,6 +569,13 @@ func (s *EtcdServer) applyAll(ep *etcdProgress, apply *apply) {
 	// storage, since the raft routine might be slower than apply routine.
 	<-apply.raftDone
 	s.triggerSnapshot(ep)
+	select {
+	// snapshot requested via send()
+	case m := <-s.msgSnapC:
+		merged := s.createMergedSnapshotMessage(m, ep.appliedi, ep.confState)
+		s.sendMergedSnap(merged)
+	default:
+	}
 }
 
 func (s *EtcdServer) applySnapshot(ep *etcdProgress, apply *apply) {
@@ -610,8 +599,6 @@ func (s *EtcdServer) applySnapshot(ep *etcdProgress, apply *apply) {
 			plog.Panicf("rename snapshot file error: %v", err)
 		}
 
-		// TODO: recover leassor
-
 		newbe := backend.NewDefaultBackend(fn)
 		if err := s.kv.Restore(newbe); err != nil {
 			plog.Panicf("restore KV error: %v", err)
@@ -620,6 +607,7 @@ func (s *EtcdServer) applySnapshot(ep *etcdProgress, apply *apply) {
 		// Closing old backend might block until all the txns
 		// on the backend are finished.
 		// We do not want to wait on closing the old backend.
+		s.bemu.Lock()
 		oldbe := s.be
 		go func() {
 			if err := oldbe.Close(); err != nil {
@@ -628,6 +616,11 @@ func (s *EtcdServer) applySnapshot(ep *etcdProgress, apply *apply) {
 		}()
 
 		s.be = newbe
+		s.bemu.Unlock()
+
+		if s.lessor != nil {
+			s.lessor.Recover(newbe, s.kv)
+		}
 	}
 	if err := s.store.Recovery(apply.snapshot.Data); err != nil {
 		plog.Panicf("recovery store error: %v", err)
@@ -660,6 +653,9 @@ func (s *EtcdServer) applyEntries(ep *etcdProgress, apply *apply) {
 	var ents []raftpb.Entry
 	if ep.appliedi+1-firsti < uint64(len(apply.entries)) {
 		ents = apply.entries[ep.appliedi+1-firsti:]
+	}
+	if len(ents) == 0 {
+		return
 	}
 	var shouldstop bool
 	if ep.appliedi, shouldstop = s.apply(ents, &ep.confState); shouldstop {
@@ -698,7 +694,10 @@ func (s *EtcdServer) Stop() {
 }
 
 func (s *EtcdServer) stopWithDelay(d time.Duration, err error) {
-	time.Sleep(d)
+	select {
+	case <-time.After(d):
+	case <-s.done:
+	}
 	select {
 	case s.errorc <- err:
 	default:
@@ -833,11 +832,12 @@ func (s *EtcdServer) UpdateMember(ctx context.Context, memb Member) error {
 }
 
 // Implement the RaftTimer interface
+
 func (s *EtcdServer) Index() uint64 { return atomic.LoadUint64(&s.r.index) }
 
 func (s *EtcdServer) Term() uint64 { return atomic.LoadUint64(&s.r.term) }
 
-// Only for testing purpose
+// Lead is only for testing purposes.
 // TODO: add Raft server interface to expose raft related info:
 // Index, Term, Lead, Committed, Applied, LastIndex, etc.
 func (s *EtcdServer) Lead() uint64 { return atomic.LoadUint64(&s.r.lead) }
@@ -927,6 +927,7 @@ func (s *EtcdServer) publish(timeout time.Duration) {
 	}
 }
 
+// TODO: move this function into raft.go
 func (s *EtcdServer) send(ms []raftpb.Message) {
 	for i := range ms {
 		if s.cluster.IsIDRemoved(types.ID(ms[i].To)) {
@@ -946,6 +947,14 @@ func (s *EtcdServer) send(ms []raftpb.Message) {
 					// drop msgSnap if the inflight chan if full.
 				}
 				ms[i].To = 0
+			}
+		}
+		if ms[i].Type == raftpb.MsgHeartbeat {
+			ok, exceed := s.r.td.Observe(ms[i].To)
+			if !ok {
+				// TODO: limit request rate.
+				plog.Warningf("failed to send out heartbeat on time (deadline exceeded for %v)", exceed)
+				plog.Warningf("server is likely overloaded")
 			}
 		}
 	}
@@ -1035,24 +1044,30 @@ func (s *EtcdServer) applyRequest(r pb.Request) Response {
 	f := func(ev *store.Event, err error) Response {
 		return Response{Event: ev, err: err}
 	}
-	expr := timeutil.UnixNanoToTime(r.Expiration)
+
+	refresh, _ := pbutil.GetBool(r.Refresh)
+	ttlOptions := store.TTLOptionSet{Refresh: refresh}
+	if r.Expiration != 0 {
+		ttlOptions.ExpireTime = time.Unix(0, r.Expiration)
+	}
+
 	switch r.Method {
 	case "POST":
-		return f(s.store.Create(r.Path, r.Dir, r.Val, true, expr))
+		return f(s.store.Create(r.Path, r.Dir, r.Val, true, ttlOptions))
 	case "PUT":
 		exists, existsSet := pbutil.GetBool(r.PrevExist)
 		switch {
 		case existsSet:
 			if exists {
 				if r.PrevIndex == 0 && r.PrevValue == "" {
-					return f(s.store.Update(r.Path, r.Val, expr))
+					return f(s.store.Update(r.Path, r.Val, ttlOptions))
 				} else {
-					return f(s.store.CompareAndSwap(r.Path, r.PrevValue, r.PrevIndex, r.Val, expr))
+					return f(s.store.CompareAndSwap(r.Path, r.PrevValue, r.PrevIndex, r.Val, ttlOptions))
 				}
 			}
-			return f(s.store.Create(r.Path, r.Dir, r.Val, false, expr))
+			return f(s.store.Create(r.Path, r.Dir, r.Val, false, ttlOptions))
 		case r.PrevIndex > 0 || r.PrevValue != "":
-			return f(s.store.CompareAndSwap(r.Path, r.PrevValue, r.PrevIndex, r.Val, expr))
+			return f(s.store.CompareAndSwap(r.Path, r.PrevValue, r.PrevIndex, r.Val, ttlOptions))
 		default:
 			// TODO (yicheng): cluster should be the owner of cluster prefix store
 			// we should not modify cluster store here.
@@ -1070,7 +1085,7 @@ func (s *EtcdServer) applyRequest(r pb.Request) Response {
 			if r.Path == path.Join(StoreClusterPrefix, "version") {
 				s.cluster.SetVersion(semver.Must(semver.NewVersion(r.Val)))
 			}
-			return f(s.store.Set(r.Path, r.Dir, r.Val, expr))
+			return f(s.store.Set(r.Path, r.Dir, r.Val, ttlOptions))
 		}
 	case "DELETE":
 		switch {
@@ -1204,7 +1219,7 @@ func (s *EtcdServer) ClusterVersion() *semver.Version {
 	return s.cluster.Version()
 }
 
-// monitorVersions checks the member's version every monitorVersion interval.
+// monitorVersions checks the member's version every monitorVersionInterval.
 // It updates the cluster version if all members agrees on a higher one.
 // It prints out log if there is a member with a higher version than the
 // local version.
@@ -1221,7 +1236,7 @@ func (s *EtcdServer) monitorVersions() {
 			continue
 		}
 
-		v := decideClusterVersion(getVersions(s.cluster, s.id, s.versionRt))
+		v := decideClusterVersion(getVersions(s.cluster, s.id, s.peerRt))
 		if v != nil {
 			// only keep major.minor version for comparison
 			v = &semver.Version{
@@ -1307,3 +1322,10 @@ func (s *EtcdServer) parseProposeCtxErr(err error, start time.Time) error {
 }
 
 func (s *EtcdServer) getKV() dstorage.ConsistentWatchableKV { return s.kv }
+func (s *EtcdServer) Backend() backend.Backend {
+	s.bemu.Lock()
+	defer s.bemu.Unlock()
+	return s.be
+}
+
+func (s *EtcdServer) AuthStore() auth.AuthStore { return s.authStore }

@@ -27,16 +27,19 @@ import (
 
 // TestLessorGrant ensures Lessor can grant wanted lease.
 // The granted lease should have a unique ID with a term
-// that is greater than minLeaseTerm.
+// that is greater than minLeaseTTL.
 func TestLessorGrant(t *testing.T) {
 	dir, be := NewTestBackend(t)
 	defer os.RemoveAll(dir)
 	defer be.Close()
 
-	le := newLessor(1, be)
-	le.Promote()
+	le := newLessor(be)
+	le.Promote(0)
 
-	l := le.Grant(1)
+	l, err := le.Grant(1, 1)
+	if err != nil {
+		t.Fatalf("could not grant lease 1 (%v)", err)
+	}
 	gl := le.get(l.ID)
 
 	if !reflect.DeepEqual(gl, l) {
@@ -46,7 +49,15 @@ func TestLessorGrant(t *testing.T) {
 		t.Errorf("term = %v, want at least %v", l.expiry.Sub(time.Now()), time.Duration(minLeaseTTL)*time.Second-time.Second)
 	}
 
-	nl := le.Grant(1)
+	nl, err := le.Grant(1, 1)
+	if err == nil {
+		t.Errorf("allocated the same lease")
+	}
+
+	nl, err = le.Grant(2, 1)
+	if err != nil {
+		t.Errorf("could not grant lease 2 (%v)", err)
+	}
 	if nl.ID == l.ID {
 		t.Errorf("new lease.id = %x, want != %x", nl.ID, l.ID)
 	}
@@ -61,7 +72,7 @@ func TestLessorGrant(t *testing.T) {
 
 // TestLessorRevoke ensures Lessor can revoke a lease.
 // The items in the revoked lease should be removed from
-// the DeleteableKV.
+// the backend.
 // The revoked lease cannot be got from Lessor again.
 func TestLessorRevoke(t *testing.T) {
 	dir, be := NewTestBackend(t)
@@ -70,25 +81,26 @@ func TestLessorRevoke(t *testing.T) {
 
 	fd := &fakeDeleter{}
 
-	le := newLessor(1, be)
+	le := newLessor(be)
 	le.SetRangeDeleter(fd)
 
 	// grant a lease with long term (100 seconds) to
 	// avoid early termination during the test.
-	l := le.Grant(100)
+	l, err := le.Grant(1, 100)
+	if err != nil {
+		t.Fatalf("could not grant lease for 100s ttl (%v)", err)
+	}
 
 	items := []LeaseItem{
 		{"foo"},
 		{"bar"},
 	}
 
-	err := le.Attach(l.ID, items)
-	if err != nil {
+	if err := le.Attach(l.ID, items); err != nil {
 		t.Fatalf("failed to attach items to the lease: %v", err)
 	}
 
-	err = le.Revoke(l.ID)
-	if err != nil {
+	if err = le.Revoke(l.ID); err != nil {
 		t.Fatal("failed to revoke lease:", err)
 	}
 
@@ -115,10 +127,13 @@ func TestLessorRenew(t *testing.T) {
 	defer be.Close()
 	defer os.RemoveAll(dir)
 
-	le := newLessor(1, be)
-	le.Promote()
+	le := newLessor(be)
+	le.Promote(0)
 
-	l := le.Grant(5)
+	l, err := le.Grant(1, 5)
+	if err != nil {
+		t.Fatalf("failed to grant lease (%v)", err)
+	}
 
 	// manually change the ttl field
 	l.TTL = 10
@@ -136,6 +151,45 @@ func TestLessorRenew(t *testing.T) {
 	}
 }
 
+func TestLessorDetach(t *testing.T) {
+	dir, be := NewTestBackend(t)
+	defer os.RemoveAll(dir)
+	defer be.Close()
+
+	fd := &fakeDeleter{}
+
+	le := newLessor(be)
+	le.SetRangeDeleter(fd)
+
+	// grant a lease with long term (100 seconds) to
+	// avoid early termination during the test.
+	l, err := le.Grant(1, 100)
+	if err != nil {
+		t.Fatalf("could not grant lease for 100s ttl (%v)", err)
+	}
+
+	items := []LeaseItem{
+		{"foo"},
+		{"bar"},
+	}
+
+	if err := le.Attach(l.ID, items); err != nil {
+		t.Fatalf("failed to attach items to the lease: %v", err)
+	}
+
+	if err := le.Detach(l.ID, items[0:1]); err != nil {
+		t.Fatalf("failed to de-attach items to the lease: %v", err)
+	}
+
+	l = le.Lookup(l.ID)
+	if len(l.itemSet) != 1 {
+		t.Fatalf("len(l.itemSet) = %d, failed to de-attach items", len(l.itemSet))
+	}
+	if _, ok := l.itemSet[LeaseItem{"bar"}]; !ok {
+		t.Fatalf("de-attached wrong item, want %q exists", "bar")
+	}
+}
+
 // TestLessorRecover ensures Lessor recovers leases from
 // persist backend.
 func TestLessorRecover(t *testing.T) {
@@ -143,12 +197,15 @@ func TestLessorRecover(t *testing.T) {
 	defer os.RemoveAll(dir)
 	defer be.Close()
 
-	le := newLessor(1, be)
-	l1 := le.Grant(10)
-	l2 := le.Grant(20)
+	le := newLessor(be)
+	l1, err1 := le.Grant(1, 10)
+	l2, err2 := le.Grant(2, 20)
+	if err1 != nil || err2 != nil {
+		t.Fatalf("could not grant initial leases (%v, %v)", err1, err2)
+	}
 
 	// Create a new lessor with the same backend
-	nle := newLessor(1, be)
+	nle := newLessor(be)
 	nl1 := nle.get(l1.ID)
 	if nl1 == nil || nl1.TTL != l1.TTL {
 		t.Errorf("nl1 = %v, want nl1.TTL= %d", nl1.TTL, l1.TTL)

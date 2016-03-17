@@ -4,20 +4,25 @@
 
 package etcdserverpb
 
-import proto "github.com/coreos/etcd/Godeps/_workspace/src/github.com/gogo/protobuf/proto"
+import (
+	"fmt"
 
-// discarding unused import gogoproto "github.com/coreos/etcd/Godeps/_workspace/src/gogoproto"
+	proto "github.com/coreos/etcd/Godeps/_workspace/src/github.com/gogo/protobuf/proto"
+)
+
+import math "math"
 
 import io "io"
-import fmt "fmt"
 
 // Reference imports to suppress errors if they are not otherwise used.
 var _ = proto.Marshal
+var _ = fmt.Errorf
+var _ = math.Inf
 
 // An InternalRaftRequest is the union of all requests which can be
 // sent via raft.
 type InternalRaftRequest struct {
-	ID          uint64              `protobuf:"varint,1,opt,proto3" json:"ID,omitempty"`
+	ID          uint64              `protobuf:"varint,1,opt,name=ID,proto3" json:"ID,omitempty"`
 	V2          *Request            `protobuf:"bytes,2,opt,name=v2" json:"v2,omitempty"`
 	Range       *RangeRequest       `protobuf:"bytes,3,opt,name=range" json:"range,omitempty"`
 	Put         *PutRequest         `protobuf:"bytes,4,opt,name=put" json:"put,omitempty"`
@@ -26,6 +31,7 @@ type InternalRaftRequest struct {
 	Compaction  *CompactionRequest  `protobuf:"bytes,7,opt,name=compaction" json:"compaction,omitempty"`
 	LeaseCreate *LeaseCreateRequest `protobuf:"bytes,8,opt,name=lease_create" json:"lease_create,omitempty"`
 	LeaseRevoke *LeaseRevokeRequest `protobuf:"bytes,9,opt,name=lease_revoke" json:"lease_revoke,omitempty"`
+	AuthEnable  *AuthEnableRequest  `protobuf:"bytes,10,opt,name=auth_enable" json:"auth_enable,omitempty"`
 }
 
 func (m *InternalRaftRequest) Reset()         { *m = InternalRaftRequest{} }
@@ -39,6 +45,10 @@ func (m *EmptyResponse) Reset()         { *m = EmptyResponse{} }
 func (m *EmptyResponse) String() string { return proto.CompactTextString(m) }
 func (*EmptyResponse) ProtoMessage()    {}
 
+func init() {
+	proto.RegisterType((*InternalRaftRequest)(nil), "etcdserverpb.InternalRaftRequest")
+	proto.RegisterType((*EmptyResponse)(nil), "etcdserverpb.EmptyResponse")
+}
 func (m *InternalRaftRequest) Marshal() (data []byte, err error) {
 	size := m.Size()
 	data = make([]byte, size)
@@ -139,6 +149,16 @@ func (m *InternalRaftRequest) MarshalTo(data []byte) (int, error) {
 		}
 		i += n8
 	}
+	if m.AuthEnable != nil {
+		data[i] = 0x52
+		i++
+		i = encodeVarintRaftInternal(data, i, uint64(m.AuthEnable.Size()))
+		n9, err := m.AuthEnable.MarshalTo(data[i:])
+		if err != nil {
+			return 0, err
+		}
+		i += n9
+	}
 	return i, nil
 }
 
@@ -225,6 +245,10 @@ func (m *InternalRaftRequest) Size() (n int) {
 		l = m.LeaseRevoke.Size()
 		n += 1 + l + sovRaftInternal(uint64(l))
 	}
+	if m.AuthEnable != nil {
+		l = m.AuthEnable.Size()
+		n += 1 + l + sovRaftInternal(uint64(l))
+	}
 	return n
 }
 
@@ -251,8 +275,12 @@ func (m *InternalRaftRequest) Unmarshal(data []byte) error {
 	l := len(data)
 	iNdEx := 0
 	for iNdEx < l {
+		preIndex := iNdEx
 		var wire uint64
 		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowRaftInternal
+			}
 			if iNdEx >= l {
 				return io.ErrUnexpectedEOF
 			}
@@ -265,6 +293,12 @@ func (m *InternalRaftRequest) Unmarshal(data []byte) error {
 		}
 		fieldNum := int32(wire >> 3)
 		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: InternalRaftRequest: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: InternalRaftRequest: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
 		switch fieldNum {
 		case 1:
 			if wireType != 0 {
@@ -272,6 +306,9 @@ func (m *InternalRaftRequest) Unmarshal(data []byte) error {
 			}
 			m.ID = 0
 			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowRaftInternal
+				}
 				if iNdEx >= l {
 					return io.ErrUnexpectedEOF
 				}
@@ -288,6 +325,9 @@ func (m *InternalRaftRequest) Unmarshal(data []byte) error {
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowRaftInternal
+				}
 				if iNdEx >= l {
 					return io.ErrUnexpectedEOF
 				}
@@ -318,6 +358,9 @@ func (m *InternalRaftRequest) Unmarshal(data []byte) error {
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowRaftInternal
+				}
 				if iNdEx >= l {
 					return io.ErrUnexpectedEOF
 				}
@@ -348,6 +391,9 @@ func (m *InternalRaftRequest) Unmarshal(data []byte) error {
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowRaftInternal
+				}
 				if iNdEx >= l {
 					return io.ErrUnexpectedEOF
 				}
@@ -378,6 +424,9 @@ func (m *InternalRaftRequest) Unmarshal(data []byte) error {
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowRaftInternal
+				}
 				if iNdEx >= l {
 					return io.ErrUnexpectedEOF
 				}
@@ -408,6 +457,9 @@ func (m *InternalRaftRequest) Unmarshal(data []byte) error {
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowRaftInternal
+				}
 				if iNdEx >= l {
 					return io.ErrUnexpectedEOF
 				}
@@ -438,6 +490,9 @@ func (m *InternalRaftRequest) Unmarshal(data []byte) error {
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowRaftInternal
+				}
 				if iNdEx >= l {
 					return io.ErrUnexpectedEOF
 				}
@@ -468,6 +523,9 @@ func (m *InternalRaftRequest) Unmarshal(data []byte) error {
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowRaftInternal
+				}
 				if iNdEx >= l {
 					return io.ErrUnexpectedEOF
 				}
@@ -498,6 +556,9 @@ func (m *InternalRaftRequest) Unmarshal(data []byte) error {
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowRaftInternal
+				}
 				if iNdEx >= l {
 					return io.ErrUnexpectedEOF
 				}
@@ -522,16 +583,41 @@ func (m *InternalRaftRequest) Unmarshal(data []byte) error {
 				return err
 			}
 			iNdEx = postIndex
-		default:
-			var sizeOfWire int
-			for {
-				sizeOfWire++
-				wire >>= 7
-				if wire == 0 {
+		case 10:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field AuthEnable", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowRaftInternal
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := data[iNdEx]
+				iNdEx++
+				msglen |= (int(b) & 0x7F) << shift
+				if b < 0x80 {
 					break
 				}
 			}
-			iNdEx -= sizeOfWire
+			if msglen < 0 {
+				return ErrInvalidLengthRaftInternal
+			}
+			postIndex := iNdEx + msglen
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if m.AuthEnable == nil {
+				m.AuthEnable = &AuthEnableRequest{}
+			}
+			if err := m.AuthEnable.Unmarshal(data[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
 			skippy, err := skipRaftInternal(data[iNdEx:])
 			if err != nil {
 				return err
@@ -546,14 +632,21 @@ func (m *InternalRaftRequest) Unmarshal(data []byte) error {
 		}
 	}
 
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
 	return nil
 }
 func (m *EmptyResponse) Unmarshal(data []byte) error {
 	l := len(data)
 	iNdEx := 0
 	for iNdEx < l {
+		preIndex := iNdEx
 		var wire uint64
 		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowRaftInternal
+			}
 			if iNdEx >= l {
 				return io.ErrUnexpectedEOF
 			}
@@ -565,17 +658,16 @@ func (m *EmptyResponse) Unmarshal(data []byte) error {
 			}
 		}
 		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: EmptyResponse: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: EmptyResponse: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
 		switch fieldNum {
 		default:
-			var sizeOfWire int
-			for {
-				sizeOfWire++
-				wire >>= 7
-				if wire == 0 {
-					break
-				}
-			}
-			iNdEx -= sizeOfWire
+			iNdEx = preIndex
 			skippy, err := skipRaftInternal(data[iNdEx:])
 			if err != nil {
 				return err
@@ -590,6 +682,9 @@ func (m *EmptyResponse) Unmarshal(data []byte) error {
 		}
 	}
 
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
 	return nil
 }
 func skipRaftInternal(data []byte) (n int, err error) {
@@ -598,6 +693,9 @@ func skipRaftInternal(data []byte) (n int, err error) {
 	for iNdEx < l {
 		var wire uint64
 		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return 0, ErrIntOverflowRaftInternal
+			}
 			if iNdEx >= l {
 				return 0, io.ErrUnexpectedEOF
 			}
@@ -611,7 +709,10 @@ func skipRaftInternal(data []byte) (n int, err error) {
 		wireType := int(wire & 0x7)
 		switch wireType {
 		case 0:
-			for {
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return 0, ErrIntOverflowRaftInternal
+				}
 				if iNdEx >= l {
 					return 0, io.ErrUnexpectedEOF
 				}
@@ -627,6 +728,9 @@ func skipRaftInternal(data []byte) (n int, err error) {
 		case 2:
 			var length int
 			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return 0, ErrIntOverflowRaftInternal
+				}
 				if iNdEx >= l {
 					return 0, io.ErrUnexpectedEOF
 				}
@@ -647,6 +751,9 @@ func skipRaftInternal(data []byte) (n int, err error) {
 				var innerWire uint64
 				var start int = iNdEx
 				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return 0, ErrIntOverflowRaftInternal
+					}
 					if iNdEx >= l {
 						return 0, io.ErrUnexpectedEOF
 					}
@@ -682,4 +789,5 @@ func skipRaftInternal(data []byte) (n int, err error) {
 
 var (
 	ErrInvalidLengthRaftInternal = fmt.Errorf("proto: negative length found during unmarshaling")
+	ErrIntOverflowRaftInternal   = fmt.Errorf("proto: integer overflow")
 )

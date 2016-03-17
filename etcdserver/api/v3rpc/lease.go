@@ -32,7 +32,11 @@ func NewLeaseServer(le etcdserver.Lessor) pb.LeaseServer {
 }
 
 func (ls *LeaseServer) LeaseCreate(ctx context.Context, cr *pb.LeaseCreateRequest) (*pb.LeaseCreateResponse, error) {
-	return ls.le.LeaseCreate(ctx, cr)
+	resp, err := ls.le.LeaseCreate(ctx, cr)
+	if err == lease.ErrLeaseExists {
+		return nil, ErrLeaseExist
+	}
+	return resp, err
 }
 
 func (ls *LeaseServer) LeaseRevoke(ctx context.Context, rr *pb.LeaseRevokeRequest) (*pb.LeaseRevokeResponse, error) {
@@ -54,12 +58,12 @@ func (ls *LeaseServer) LeaseKeepAlive(stream pb.Lease_LeaseKeepAliveServer) erro
 		}
 
 		ttl, err := ls.le.LeaseRenew(lease.LeaseID(req.ID))
-		if err != nil {
-			if err == lease.ErrLeaseNotFound {
-				return ErrLeaseNotFound
-			}
-			// TODO: handle not primary error by forwarding renew requests to leader
-			panic("TODO: handle not primary error by forwarding renew requests to leader")
+		if err == lease.ErrLeaseNotFound {
+			return ErrLeaseNotFound
+		}
+
+		if err != nil && err != lease.ErrLeaseNotFound {
+			return err
 		}
 
 		resp := &pb.LeaseKeepAliveResponse{ID: req.ID, TTL: ttl}

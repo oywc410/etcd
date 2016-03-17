@@ -21,6 +21,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/coreos/etcd/pkg/mock/mockstore"
 	"github.com/coreos/etcd/pkg/testutil"
 	"github.com/coreos/etcd/pkg/types"
 	"github.com/coreos/etcd/raft/raftpb"
@@ -406,7 +407,7 @@ func TestClusterGenID(t *testing.T) {
 	}
 	previd := cs.ID()
 
-	cs.SetStore(store.NewNop())
+	cs.SetStore(mockstore.NewNop())
 	cs.AddMember(newTestMember(3, nil, "", nil))
 	cs.genID()
 	if cs.ID() == previd {
@@ -447,7 +448,7 @@ func TestNodeToMemberBad(t *testing.T) {
 }
 
 func TestClusterAddMember(t *testing.T) {
-	st := store.NewRecorder()
+	st := mockstore.NewRecorder()
 	c := newTestCluster(nil)
 	c.SetStore(st)
 	c.AddMember(newTestMember(1, nil, "node1", nil))
@@ -460,7 +461,7 @@ func TestClusterAddMember(t *testing.T) {
 				false,
 				`{"peerURLs":null}`,
 				false,
-				store.Permanent,
+				store.TTLOptionSet{ExpireTime: store.Permanent},
 			},
 		},
 	}
@@ -492,14 +493,14 @@ func TestClusterMembers(t *testing.T) {
 }
 
 func TestClusterRemoveMember(t *testing.T) {
-	st := store.NewRecorder()
+	st := mockstore.NewRecorder()
 	c := newTestCluster(nil)
 	c.SetStore(st)
 	c.RemoveMember(1)
 
 	wactions := []testutil.Action{
 		{Name: "Delete", Params: []interface{}{memberStoreKey(1), true, true}},
-		{Name: "Create", Params: []interface{}{removedMemberStoreKey(1), false, "", false, store.Permanent}},
+		{Name: "Create", Params: []interface{}{removedMemberStoreKey(1), false, "", false, store.TTLOptionSet{ExpireTime: store.Permanent}}},
 	}
 	if !reflect.DeepEqual(st.Action(), wactions) {
 		t.Errorf("actions = %v, want %v", st.Action(), wactions)
@@ -673,7 +674,7 @@ func TestIsReadyToRemoveMember(t *testing.T) {
 		},
 		{
 			// 1/2 members ready, should be fine to remove unstarted member
-			// (iReadyToRemoveMember() logic should return success, but operation itself would fail)
+			// (isReadyToRemoveMember() logic should return success, but operation itself would fail)
 			[]*Member{
 				newTestMember(1, nil, "1", nil),
 				newTestMember(2, nil, "", nil),

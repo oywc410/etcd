@@ -30,7 +30,7 @@ type Recorder interface {
 	// Record publishes an Action (e.g., function call) which will
 	// be reflected by Wait() or Chan()
 	Record(a Action)
-	// Wait waits until at least n Actions are availble or returns with error
+	// Wait waits until at least n Actions are available or returns with error
 	Wait(n int) ([]Action, error)
 	// Action returns immediately available Actions
 	Action() []Action
@@ -100,7 +100,6 @@ func (r *recorderStream) Action() (acts []Action) {
 			return acts
 		}
 	}
-	return acts
 }
 
 func (r *recorderStream) Chan() <-chan Action {

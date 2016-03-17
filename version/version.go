@@ -29,13 +29,13 @@ import (
 var (
 	// MinClusterVersion is the min cluster version this etcd binary is compatible with.
 	MinClusterVersion = "2.2.0"
-	Version           = "2.3.0-alpha.0+git"
+	Version           = "2.3.0-alpha.1+git"
 
 	// Git SHA Value will be set during build
 	GitSHA = "Not provided (use ./build instead of go build)"
 )
 
-// WalVersion is an enum for versions of etcd logs.
+// DataDirVersion is an enum for versions of etcd logs.
 type DataDirVersion string
 
 const (

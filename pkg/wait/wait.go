@@ -17,9 +17,8 @@
 package wait
 
 import (
+	"log"
 	"sync"
-
-	"github.com/coreos/etcd/pkg/testutil"
 )
 
 type Wait interface {
@@ -43,6 +42,8 @@ func (w *List) Register(id uint64) <-chan interface{} {
 	if ch == nil {
 		ch = make(chan interface{}, 1)
 		w.m[id] = ch
+	} else {
+		log.Panicf("dup id %x", id)
 	}
 	return ch
 }
@@ -56,29 +57,6 @@ func (w *List) Trigger(id uint64, x interface{}) {
 		ch <- x
 		close(ch)
 	}
-}
-
-type WaitRecorder struct {
-	Wait
-	testutil.Recorder
-}
-
-type waitRecorder struct {
-	testutil.RecorderBuffered
-}
-
-func NewRecorder() *WaitRecorder {
-	wr := &waitRecorder{}
-	return &WaitRecorder{Wait: wr, Recorder: wr}
-}
-func NewNop() Wait { return NewRecorder() }
-
-func (w *waitRecorder) Register(id uint64) <-chan interface{} {
-	w.Record(testutil.Action{Name: "Register"})
-	return nil
-}
-func (w *waitRecorder) Trigger(id uint64, x interface{}) {
-	w.Record(testutil.Action{Name: "Trigger"})
 }
 
 type waitWithResponse struct {

@@ -37,7 +37,7 @@ import (
 // continuously, and closes it when stopped.
 func TestStreamWriterAttachOutgoingConn(t *testing.T) {
 	sw := startStreamWriter(types.ID(1), newPeerStatus(types.ID(1)), &stats.FollowerStats{}, &fakeRaft{})
-	// the expected initial state of streamWrite is not working
+	// the expected initial state of streamWriter is not working
 	if _, ok := sw.writec(); ok != false {
 		t.Errorf("initial working status = %v, want false", ok)
 	}
@@ -116,7 +116,7 @@ func TestStreamReaderDialRequest(t *testing.T) {
 	for i, tt := range []streamType{streamTypeMessage, streamTypeMsgAppV2} {
 		tr := &roundTripperRecorder{}
 		sr := &streamReader{
-			tr:     tr,
+			tr:     &Transport{streamRt: tr},
 			picker: mustNewURLPicker(t, []string{"http://localhost:2380"}),
 			local:  types.ID(1),
 			remote: types.ID(2),
@@ -166,7 +166,7 @@ func TestStreamReaderDialResult(t *testing.T) {
 			err:    tt.err,
 		}
 		sr := &streamReader{
-			tr:     tr,
+			tr:     &Transport{streamRt: tr},
 			picker: mustNewURLPicker(t, []string{"http://localhost:2380"}),
 			local:  types.ID(1),
 			remote: types.ID(2),
@@ -194,7 +194,7 @@ func TestStreamReaderDialDetectUnsupport(t *testing.T) {
 			header: http.Header{},
 		}
 		sr := &streamReader{
-			tr:     tr,
+			tr:     &Transport{streamRt: tr},
 			picker: mustNewURLPicker(t, []string{"http://localhost:2380"}),
 			local:  types.ID(1),
 			remote: types.ID(2),
@@ -254,7 +254,8 @@ func TestStream(t *testing.T) {
 		h.sw = sw
 
 		picker := mustNewURLPicker(t, []string{srv.URL})
-		sr := startStreamReader(&http.Transport{}, picker, tt.t, types.ID(1), types.ID(2), types.ID(1), newPeerStatus(types.ID(1)), recvc, propc, nil)
+		tr := &Transport{streamRt: &http.Transport{}}
+		sr := startStreamReader(tr, picker, tt.t, types.ID(1), types.ID(2), types.ID(1), newPeerStatus(types.ID(1)), recvc, propc, nil)
 		defer sr.stop()
 		// wait for stream to work
 		var writec chan<- raftpb.Message

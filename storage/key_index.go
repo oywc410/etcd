@@ -27,7 +27,7 @@ var (
 	ErrRevisionNotFound = errors.New("stroage: revision not found")
 )
 
-// keyIndex stores the revision of an key in the backend.
+// keyIndex stores the revisions of a key in the backend.
 // Each keyIndex has at least one key generation.
 // Each generation might have several key versions.
 // Tombstone on a key appends an tombstone version at the end
@@ -146,7 +146,7 @@ func (ki *keyIndex) get(atRev int64) (modified, created revision, ver int64, err
 	return revision{}, revision{}, 0, ErrRevisionNotFound
 }
 
-// since returns revisions since the give rev. Only the revision with the
+// since returns revisions since the given rev. Only the revision with the
 // largest sub revision will be returned if multiple revisions have the same
 // main revision.
 func (ki *keyIndex) since(rev int64) []revision {
@@ -196,7 +196,7 @@ func (ki *keyIndex) compact(atRev int64, available map[revision]struct{}) {
 	}
 
 	// walk until reaching the first revision that has an revision smaller or equal to
-	// the atRevision.
+	// the atRev.
 	// add it to the available map
 	f := func(rev revision) bool {
 		if rev.main <= atRev {
@@ -237,7 +237,7 @@ func (ki *keyIndex) isEmpty() bool {
 	return len(ki.generations) == 1 && ki.generations[0].isEmpty()
 }
 
-// findGeneartion finds out the generation of the keyIndex that the
+// findGeneration finds out the generation of the keyIndex that the
 // given rev belongs to. If the given rev is at the gap of two generations,
 // which means that the key does not exist at the given rev, it returns nil.
 func (ki *keyIndex) findGeneration(rev int64) *generation {
